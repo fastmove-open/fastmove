@@ -386,7 +386,7 @@ static int aio_migratepage(struct address_space *mapping, struct page *new,
 	 * happen under the ctx->completion_lock. That does not work with the
 	 * migration workflow of MIGRATE_SYNC_NO_COPY.
 	 */
-	if (mode == MIGRATE_SYNC_NO_COPY)
+	if (mode & MIGRATE_SYNC_NO_COPY)
 		return -EINVAL;
 
 	rc = 0;
@@ -434,7 +434,7 @@ static int aio_migratepage(struct address_space *mapping, struct page *new,
 	 * events from being lost.
 	 */
 	spin_lock_irqsave(&ctx->completion_lock, flags);
-	migrate_page_copy(new, old);
+	migrate_page_copy(new, old, MIGRATE_SINGLETHREAD);
 	BUG_ON(ctx->ring_pages[idx] != old);
 	ctx->ring_pages[idx] = new;
 	spin_unlock_irqrestore(&ctx->completion_lock, flags);

@@ -1,0 +1,26 @@
+config NOVA_DM_FS
+	tristate "NOVA: log-structured file system for non-volatile memories for device mapper"
+	depends on FS_DAX
+	select CRC32
+	select LIBCRC32C
+	help
+	  If your system has a block of fast (comparable in access speed to
+	  system memory) and non-volatile byte-addressable memory and you wish
+	  to mount a light-weight filesystem with strong consistency support
+	  over it, say Y here.
+
+	  To compile this as a module, choose M here: the module will be
+	  called nova.
+
+	  If unsure, say N.
+
+config NOVA_DM_VERBOSE_CHECK
+	bool "Enable verbose memory checks for NOVA_DM"
+	depends on NOVA_DM_FS
+	help
+	  Enables block allocation checks and other expensive checks for integrity.
+	  When NOVA is run on a device mapper, the allocation and memory translation
+	  scheme is changed, and this option enables runtime checks for correctness
+	  of block allocation and memory translation.
+
+	  Has very huge impact on performance, if unsure, say N.

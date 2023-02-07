@@ -614,6 +614,23 @@ static inline bool is_migrate_highatomic_page(struct page *page)
 
 void setup_zone_pageset(struct zone *zone);
 
+extern int exchange_page_mthread(struct page *to, struct page *from,
+			int nr_pages);
+extern int exchange_page_lists_mthread(struct page **to,
+						  struct page **from,
+						  int nr_pages);
+
+extern int exchange_two_pages(struct page *page1, struct page *page2);
+
+bool buffer_migrate_lock_buffers(struct buffer_head *head,
+							enum migrate_mode mode);
+int writeout(struct address_space *mapping, struct page *page);
+
+int get_nodes(nodemask_t *nodes, const unsigned long __user *nmask,
+		     unsigned long maxnode);
+
+unsigned move_pages_to_lru(struct lruvec *lruvec, struct list_head *page_list);
+
 struct migration_target_control {
 	int nid;		/* preferred node id */
 	nodemask_t *nmask;

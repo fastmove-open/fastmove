@@ -991,6 +991,16 @@ asmlinkage long sys_pkey_alloc(unsigned long flags, unsigned long init_val);
 asmlinkage long sys_pkey_free(int pkey);
 asmlinkage long sys_statx(int dfd, const char __user *path, unsigned flags,
 			  unsigned mask, struct statx __user *buffer);
+asmlinkage long sys_exchange_pages(pid_t pid, unsigned long nr_pages,
+				const void __user * __user *from_pages,
+				const void __user * __user *to_pages,
+				int __user *status,
+				int flags);
+asmlinkage long sys_mm_manage(pid_t pid, unsigned long nr_pages,
+				unsigned long maxnode,
+				const unsigned long __user *old_nodes,
+				const unsigned long __user *new_nodes,
+				int flags);
 asmlinkage long sys_rseq(struct rseq __user *rseq, uint32_t rseq_len,
 			 int flags, uint32_t sig);
 asmlinkage long sys_open_tree(int dfd, const char __user *path, unsigned flags);

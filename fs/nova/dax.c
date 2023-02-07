@@ -18,7 +18,7 @@
 #include <linux/cpufeature.h>
 #include <asm/pgtable.h>
 #include <linux/version.h>
-#include <linux/uio.h>
+#include <linux/copy_accel.h>
 #include "nova.h"
 #include "inode.h"
 
@@ -698,9 +698,18 @@ ssize_t do_nova_inplace_file_write(struct file *filp,
 //		nova_dbg("Write: %p\n", kmem);
 		NOVA_START_TIMING(memcpy_w_nvmm_t, memcpy_time);
 		nova_memunlock_range(sb, kmem + offset, bytes);
-		// copied = bytes - memcpy_to_pmem_nocache(kmem + offset,
-		// 				buf, bytes);
-		copied = bytes - dma_copy_from_user(sb->s_bdev, kmem + offset, buf, bytes);
+
+		switch(sysctl_fastmove.mode){
+		case SYSCTL_FASTMOVE_DMA:
+			copied = bytes - memcpy_to_pmem_nocache_fastmove(sb->s_bdev, kmem + offset, buf, bytes);
+			break;
+		case SYSCTL_FASTMOVE_CPU:
+		case SYSCTL_FASTMOVE_DM:
+		default:
+			copied = bytes - memcpy_to_pmem_nocache(kmem + offset, buf, bytes);
+			break;
+		}
+			
 		nova_memlock_range(sb, kmem + offset, bytes);
 		NOVA_END_TIMING(memcpy_w_nvmm_t, memcpy_time);
 

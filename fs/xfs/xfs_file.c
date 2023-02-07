@@ -215,8 +215,17 @@ xfs_file_dax_read(
 		xfs_ilock(ip, XFS_IOLOCK_SHARED);
 	}
 
-	// ret = copy_iomap_rw_sync(iocb, to, &xfs_read_iomap_ops);
-	ret = dax_iomap_rw(iocb, to, &xfs_read_iomap_ops);
+	switch (sysctl_fastmove.mode){
+	case SYSCTL_FASTMOVE_DMA:
+		ret = dax_iomap_rw_fastmove(iocb, to, &xfs_read_iomap_ops);
+		break;
+	case SYSCTL_FASTMOVE_CPU:
+	case SYSCTL_FASTMOVE_DM:
+	default:
+		ret = dax_iomap_rw(iocb, to, &xfs_read_iomap_ops);
+		break;
+	}
+
 	xfs_iunlock(ip, XFS_IOLOCK_SHARED);
 
 	file_accessed(iocb->ki_filp);
@@ -592,8 +601,18 @@ xfs_file_dax_write(
 	count = iov_iter_count(from);
 
 	trace_xfs_file_dax_write(ip, count, pos);
-	// ret = copy_iomap_rw_sync(iocb, from, &xfs_direct_write_iomap_ops);
-	ret = dax_iomap_rw(iocb, from, &xfs_direct_write_iomap_ops);
+	
+	switch (sysctl_fastmove.mode){
+	case SYSCTL_FASTMOVE_DMA:
+		ret = dax_iomap_rw_fastmove(iocb, from, &xfs_direct_write_iomap_ops);
+		break;
+	case SYSCTL_FASTMOVE_CPU:
+	case SYSCTL_FASTMOVE_DM:
+	default:
+		ret = dax_iomap_rw(iocb, from, &xfs_direct_write_iomap_ops);
+		break;
+	}
+
 	if (ret > 0 && iocb->ki_pos > i_size_read(inode)) {
 		i_size_write(inode, iocb->ki_pos);
 		error = xfs_setfilesize(ip, pos, ret);

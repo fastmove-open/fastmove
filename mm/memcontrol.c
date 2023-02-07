@@ -65,6 +65,7 @@
 #include "slab.h"
 
 #include <linux/uaccess.h>
+#include <linux/copy_accel.h>
 
 #include <trace/events/vmscan.h>
 
@@ -3897,7 +3898,7 @@ static int mem_cgroup_move_charge_write(struct cgroup_subsys_state *css,
 #define LRU_ALL_ANON (BIT(LRU_INACTIVE_ANON) | BIT(LRU_ACTIVE_ANON))
 #define LRU_ALL	     ((1 << NR_LRU_LISTS) - 1)
 
-static unsigned long mem_cgroup_node_nr_lru_pages(struct mem_cgroup *memcg,
+unsigned long mem_cgroup_node_nr_lru_pages(struct mem_cgroup *memcg,
 				int nid, unsigned int lru_mask, bool tree)
 {
 	struct lruvec *lruvec = mem_cgroup_lruvec(memcg, NODE_DATA(nid));
@@ -5156,6 +5157,7 @@ static int alloc_mem_cgroup_per_node_info(struct mem_cgroup *memcg, int node)
 	pn->usage_in_excess = 0;
 	pn->on_tree = false;
 	pn->memcg = memcg;
+	pn->max_nr_base_pages = PAGE_COUNTER_MAX;
 
 	memcg->nodeinfo[node] = pn;
 	return 0;
@@ -7422,5 +7424,112 @@ static int __init mem_cgroup_swap_init(void)
 	return 0;
 }
 core_initcall(mem_cgroup_swap_init);
+
+static int memory_per_node_stat_show(struct seq_file *m, void *v)
+{
+	struct mem_cgroup *memcg = mem_cgroup_from_css(seq_css(m));
+	struct cftype *cur_file = seq_cft(m);
+	int nid = cur_file->numa_node_id;
+	unsigned long val = 0;
+	int i;
+
+	for (i = 0; i < NR_LRU_LISTS; i++)
+		val += mem_cgroup_node_nr_lru_pages(memcg, nid, BIT(i), false);
+
+	seq_printf(m, "%llu\n", (u64)val * PAGE_SIZE);
+
+	return 0;
+}
+
+static int memory_per_node_max_show(struct seq_file *m, void *v)
+{
+	struct mem_cgroup *memcg = mem_cgroup_from_css(seq_css(m));
+	struct cftype *cur_file = seq_cft(m);
+	int nid = cur_file->numa_node_id;
+	unsigned long max = READ_ONCE(memcg->nodeinfo[nid]->max_nr_base_pages);
+
+	if (max == PAGE_COUNTER_MAX)
+		seq_puts(m, "max\n");
+	else
+		seq_printf(m, "%llu\n", (u64)max * PAGE_SIZE);
+
+	return 0;
+}
+
+static ssize_t memory_per_node_max_write(struct kernfs_open_file *of,
+				char *buf, size_t nbytes, loff_t off)
+{
+	struct mem_cgroup *memcg = mem_cgroup_from_css(of_css(of));
+	struct cftype *cur_file = of_cft(of);
+	int nid = cur_file->numa_node_id;
+	unsigned long max;
+	int err;
+
+	buf = strstrip(buf);
+	err = page_counter_memparse(buf, "max", &max);
+	if (err)
+		return err;
+
+	xchg(&memcg->nodeinfo[nid]->max_nr_base_pages, max);
+
+	return nbytes;
+}
+
+static struct cftype memcg_per_node_stats_files[MAX_NUMNODES + 1];
+static struct cftype memcg_per_node_max_files[MAX_NUMNODES + 1];
+
+static int __init mem_cgroup_per_node_init(void)
+{
+	int nid;
+
+	for_each_node_state(nid, N_MEMORY) {
+		printk(KERN_INFO "cgroup nid:%d\n", nid);
+		snprintf(memcg_per_node_stats_files[nid].name, MAX_CFTYPE_NAME,
+				"size_at_node:%d", nid);
+		memcg_per_node_stats_files[nid].flags = CFTYPE_NOT_ON_ROOT;
+		memcg_per_node_stats_files[nid].seq_show = memory_per_node_stat_show;
+		memcg_per_node_stats_files[nid].numa_node_id = nid;
+
+		snprintf(memcg_per_node_max_files[nid].name, MAX_CFTYPE_NAME,
+				"max_at_node:%d", nid);
+		memcg_per_node_max_files[nid].flags = CFTYPE_NOT_ON_ROOT;
+		memcg_per_node_max_files[nid].seq_show = memory_per_node_max_show;
+		memcg_per_node_max_files[nid].write = memory_per_node_max_write;
+		memcg_per_node_max_files[nid].numa_node_id = nid;
+	}
+	memcg_per_node_stats_files[MAX_NUMNODES].name[0] = '\0';
+	memcg_per_node_max_files[MAX_NUMNODES].name[0] = '\0';
+
+	WARN_ON(cgroup_add_dfl_cftypes(&memory_cgrp_subsys,
+				memcg_per_node_stats_files));
+	WARN_ON(cgroup_add_dfl_cftypes(&memory_cgrp_subsys,
+				memcg_per_node_max_files));
+	return 0;
+}
+
+int proc_dointvec_minmax(struct ctl_table *table, int write,
+		    void __user *buffer, size_t *lenp, loff_t *ppos);
+int sysctl_memcg_control(struct ctl_table *table, int write,
+				 void __user *buffer, size_t *lenp,
+				 loff_t *ppos)
+{
+	int err = 0;
+	int memcg_prior_val = sysctl_fastmove.memcg;
+
+	if (write && !capable(CAP_SYS_ADMIN))
+		return -EPERM;
+
+	err = proc_dointvec_minmax(table, write, buffer, lenp, ppos);
+	if (err < 0)
+		return err;
+
+	if (write) {
+		if (memcg_prior_val == 0 && sysctl_fastmove.memcg == 1) {
+			mem_cgroup_per_node_init();
+		}
+	}
+
+	return err;
+}
 
 #endif /* CONFIG_MEMCG_SWAP */

@@ -30,6 +30,7 @@
 #include <linux/uio.h>
 #include <linux/mman.h>
 #include <linux/backing-dev.h>
+#include <linux/copy_accel.h>
 #include "ext4.h"
 #include "ext4_jbd2.h"
 #include "xattr.h"
@@ -103,8 +104,18 @@ static ssize_t ext4_dax_read_iter(struct kiocb *iocb, struct iov_iter *to)
 		/* Fallback to buffered IO in case we cannot support DAX */
 		return generic_file_read_iter(iocb, to);
 	}
-	ret = dax_iomap_rw(iocb, to, &ext4_iomap_ops);
-	// ret = copy_iomap_rw_sync(iocb, to, &ext4_iomap_ops);
+	
+	switch(sysctl_fastmove.mode){
+	case SYSCTL_FASTMOVE_DMA:
+		ret = dax_iomap_rw_fastmove(iocb, to, &ext4_iomap_ops);
+		break;
+	case SYSCTL_FASTMOVE_CPU: 
+	case SYSCTL_FASTMOVE_DM:
+	default:
+		ret = dax_iomap_rw(iocb, to, &ext4_iomap_ops);
+		break;
+	}
+
 	inode_unlock_shared(inode);
 
 	file_accessed(iocb->ki_filp);
@@ -631,8 +642,16 @@ ext4_dax_write_iter(struct kiocb *iocb, struct iov_iter *from)
 		ext4_journal_stop(handle);
 	}
 
-	// ret = copy_iomap_rw_sync(iocb, from, &ext4_iomap_ops);
-	ret = dax_iomap_rw(iocb, from, &ext4_iomap_ops);
+	switch(sysctl_fastmove.mode){
+	case SYSCTL_FASTMOVE_DMA:
+		ret = dax_iomap_rw_fastmove(iocb, from, &ext4_iomap_ops);
+		break;
+	case SYSCTL_FASTMOVE_CPU: 
+	case SYSCTL_FASTMOVE_DM:
+	default:
+		ret = dax_iomap_rw(iocb, from, &ext4_iomap_ops); 
+		break;
+	}
 
 	if (extend)
 		ret = ext4_handle_inode_extension(inode, offset, ret, count);

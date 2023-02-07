@@ -10,9 +10,6 @@
 #include <net/checksum.h>
 #include <linux/scatterlist.h>
 #include <linux/instrumented.h>
-#include <linux/mmu_context.h>
-#include <linux/kthread.h>
-#include <linux/spinlock.h>
 
 #define PIPE_PARANOIA /* for now */
 

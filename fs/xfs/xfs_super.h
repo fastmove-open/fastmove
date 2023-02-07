@@ -95,8 +95,6 @@ extern void xfs_reinit_percpu_counters(struct xfs_mount *mp);
 
 extern struct workqueue_struct *xfs_discard_wq;
 
-extern struct copy_info ci;
-
 #define XFS_M(sb)		((struct xfs_mount *)((sb)->s_fs_info))
 
 #endif	/* __XFS_SUPER_H__ */

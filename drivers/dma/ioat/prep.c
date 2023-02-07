@@ -147,6 +147,62 @@ ioat_dma_prep_memcpy_lock(struct dma_chan *c, dma_addr_t dma_dest,
 	return &desc->txd;
 }
 
+struct dma_async_tx_descriptor *
+ioat_dma_prep_memcpy_sg_lock(struct dma_chan *c,
+		struct scatterlist *sg, unsigned int sg_nents,
+		dma_addr_t dma_addr, bool to_sg, unsigned long flags)
+{
+	struct ioatdma_chan *ioat_chan = to_ioat_chan(c);
+	struct ioat_dma_descriptor *hw;
+	struct ioat_ring_ent *desc;
+	dma_addr_t dma_off = dma_addr;
+	size_t total_len = 0, len;
+	int num_descs, idx, i;
+	struct scatterlist *s;
+
+	if (test_bit(IOAT_CHAN_DOWN, &ioat_chan->state))
+		return NULL;
+
+	/*
+	 * The upper layer will garantee that each entry does not exceed
+	 * xfercap.
+	 */
+	num_descs = sg_nents;
+
+	if (likely(num_descs) &&
+	    ioat_check_space_lock(ioat_chan, num_descs) == 0)
+		idx = ioat_chan->head;
+	else
+		return NULL;
+
+	for_each_sg(sg, s, sg_nents, i) {
+		desc = ioat_get_ring_ent(ioat_chan, idx + i);
+		hw = desc->hw;
+		len = sg_dma_len(s);
+		hw->size = len;
+		hw->ctl = 0;
+		if (to_sg) {
+			hw->src_addr = dma_off;
+			hw->dst_addr = sg_dma_address(s);
+		} else {
+			hw->src_addr = sg_dma_address(s);
+			hw->dst_addr = dma_off;
+		}
+		dma_off += len;
+		total_len += len;
+		dump_desc_dbg(ioat_chan, desc);
+	}
+
+	desc->txd.flags = flags;
+	desc->len = total_len;
+	hw->ctl_f.int_en = !!(flags & DMA_PREP_INTERRUPT);
+	hw->ctl_f.fence = !!(flags & DMA_PREP_FENCE);
+	hw->ctl_f.compl_write = 1;
+	dump_desc_dbg(ioat_chan, desc);
+	/* we leave the channel locked to ensure in order submission */
+
+	return &desc->txd;
+}
 
 static struct dma_async_tx_descriptor *
 __ioat_prep_xor_lock(struct dma_chan *c, enum sum_check_flags *result,

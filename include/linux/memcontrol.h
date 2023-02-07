@@ -115,6 +115,7 @@ struct mem_cgroup_per_node {
 	atomic_long_t		lruvec_stat[NR_VM_NODE_STAT_ITEMS];
 
 	unsigned long		lru_zone_size[MAX_NR_ZONES][NR_LRU_LISTS];
+	unsigned long		max_nr_base_pages;
 
 	struct mem_cgroup_reclaim_iter	iter;
 
@@ -931,6 +932,54 @@ static inline void memcg_memory_event_mm(struct mm_struct *mm,
 void mem_cgroup_split_huge_fixup(struct page *head);
 #endif
 
+unsigned long mem_cgroup_node_nr_lru_pages(struct mem_cgroup *memcg,
+				int nid, unsigned int lru_mask, bool tree);
+
+static inline unsigned long lruvec_size_memcg_node(enum lru_list lru,
+	struct mem_cgroup *memcg, int nid)
+{
+	if (nid == MAX_NUMNODES)
+		return 0;
+
+	VM_BUG_ON(lru < 0 || lru >= NR_LRU_LISTS);
+	return mem_cgroup_node_nr_lru_pages(memcg, nid, BIT(lru), false);
+}
+
+static inline unsigned long active_inactive_size_memcg_node(struct mem_cgroup *memcg, int nid, bool active)
+{
+	unsigned long val = 0;
+	enum lru_list lru;
+
+	for_each_evictable_lru(lru) {
+		if ((active  && is_active_lru(lru)) ||
+			(!active && !is_active_lru(lru)))
+			val += mem_cgroup_node_nr_lru_pages(memcg, nid, BIT(lru), false);
+	}
+
+	return val;
+}
+
+static inline unsigned long memcg_size_node(struct mem_cgroup *memcg, int nid)
+{
+	unsigned long val = 0;
+	int i;
+
+	if (nid == MAX_NUMNODES)
+		return val;
+
+	for (i = 0; i < NR_LRU_LISTS; i++)
+		val += mem_cgroup_node_nr_lru_pages(memcg, nid, BIT(i), false);
+
+	return val;
+}
+
+static inline unsigned long memcg_max_size_node(struct mem_cgroup *memcg, int nid)
+{
+	if (nid == MAX_NUMNODES)
+		return 0;
+	return memcg->nodeinfo[nid]->max_nr_base_pages;
+}
+
 #else /* CONFIG_MEMCG */
 
 #define MEM_CGROUP_ID_SHIFT	0
@@ -1627,6 +1676,26 @@ static inline void memcg_put_cache_ids(void)
 static inline struct mem_cgroup *mem_cgroup_from_obj(void *p)
 {
        return NULL;
+}
+
+static inline unsigned long lruvec_size_memcg_node(enum lru_list lru,
+	struct mem_cgroup *memcg, int nid)
+{
+	return 0;
+}
+
+static inline unsigned long active_inactive_size_memcg_node(struct mem_cgroup *memcg, int nid, bool active)
+{
+	return 0;
+}
+
+static inline unsigned long memcg_size_node(struct mem_cgroup *memcg, int nid)
+{
+	return 0;
+}
+static inline unsigned long memcg_max_size_node(struct mem_cgroup *memcg, int nid)
+{
+	return 0;
 }
 
 #endif /* CONFIG_MEMCG_KMEM */

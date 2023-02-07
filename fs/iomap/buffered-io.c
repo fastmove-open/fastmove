@@ -524,8 +524,8 @@ iomap_migrate_page(struct address_space *mapping, struct page *newpage,
 	if (page_has_private(page))
 		attach_page_private(newpage, detach_page_private(page));
 
-	if (mode != MIGRATE_SYNC_NO_COPY)
-		migrate_page_copy(newpage, page);
+	if (!(mode & MIGRATE_SYNC_NO_COPY))
+		migrate_page_copy(newpage, page, mode);
 	else
 		migrate_page_states(newpage, page);
 	return MIGRATEPAGE_SUCCESS;

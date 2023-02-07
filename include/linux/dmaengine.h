@@ -56,6 +56,7 @@ enum dma_transaction_type {
 	DMA_PQ_VAL,
 	DMA_MEMSET,
 	DMA_MEMSET_SG,
+	DMA_MEMCPY_SG,
 	DMA_INTERRUPT,
 	DMA_PRIVATE,
 	DMA_ASYNC_TX,
@@ -545,6 +546,11 @@ struct dmaengine_result {
 typedef void (*dma_async_tx_callback_result)(void *dma_async_param,
 				const struct dmaengine_result *result);
 
+struct dmaengine_unmap_sg {
+	struct scatterlist *sg;
+	dma_addr_t buf_phys;
+};
+
 struct dmaengine_unmap_data {
 #if IS_ENABLED(CONFIG_DMA_ENGINE_RAID)
 	u16 map_cnt;
@@ -552,11 +558,15 @@ struct dmaengine_unmap_data {
 	u8 map_cnt;
 #endif
 	u8 to_cnt;
+	u8 to_sg;
 	u8 from_cnt;
+	u8 from_sg;
 	u8 bidi_cnt;
+	int sg_nents;
 	struct device *dev;
 	struct kref kref;
 	size_t len;
+	struct dmaengine_unmap_sg unmap_sg;
 	dma_addr_t addr[];
 };
 
@@ -809,6 +819,7 @@ struct dma_filter {
  * @device_prep_dma_memset: prepares a memset operation
  * @device_prep_dma_memset_sg: prepares a memset operation over a scatter list
  * @device_prep_dma_interrupt: prepares an end of chain interrupt operation
+ * @device_prep_dma_memcpy_sg: prepares memcpy between scatterlist and buffer
  * @device_prep_slave_sg: prepares a slave dma operation
  * @device_prep_dma_cyclic: prepare a cyclic dma operation suitable for audio.
  *	The function takes a buffer of size buf_len. The callback function will
@@ -872,6 +883,7 @@ struct dma_device {
 	u32 max_sg_burst;
 	bool descriptor_reuse;
 	enum dma_residue_granularity residue_granularity;
+	u64 xfercap;	/* descriptor transfer capability limit */
 
 	int (*device_alloc_chan_resources)(struct dma_chan *chan);
 	void (*device_free_chan_resources)(struct dma_chan *chan);
@@ -901,7 +913,10 @@ struct dma_device {
 		unsigned int nents, int value, unsigned long flags);
 	struct dma_async_tx_descriptor *(*device_prep_dma_interrupt)(
 		struct dma_chan *chan, unsigned long flags);
-
+	struct dma_async_tx_descriptor *(*device_prep_dma_memcpy_sg)(
+		struct dma_chan *chan,
+		struct scatterlist *sg, unsigned int sg_nents,
+		dma_addr_t buf, bool to_sg, unsigned long flags);
 	struct dma_async_tx_descriptor *(*device_prep_slave_sg)(
 		struct dma_chan *chan, struct scatterlist *sgl,
 		unsigned int sg_len, enum dma_transfer_direction direction,
@@ -1039,6 +1054,18 @@ static inline struct dma_async_tx_descriptor *dmaengine_prep_dma_memcpy(
 
 	return chan->device->device_prep_dma_memcpy(chan, dest, src,
 						    len, flags);
+}
+
+static inline struct dma_async_tx_descriptor *dmaengine_prep_dma_memcpy_sg(
+		struct dma_chan *chan, struct scatterlist *sg,
+		unsigned int sg_nents, dma_addr_t buf, bool to_sg,
+		unsigned long flags)
+{
+	if (!chan || !chan->device || !chan->device->device_prep_dma_memcpy_sg)
+		return NULL;
+
+	return chan->device->device_prep_dma_memcpy_sg(chan, sg, sg_nents,
+						       buf, to_sg, flags);
 }
 
 static inline bool dmaengine_is_metadata_mode_supported(struct dma_chan *chan,

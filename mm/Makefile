@@ -61,6 +61,12 @@ page-alloc-$(CONFIG_SHUFFLE_PAGE_ALLOCATOR) += shuffle.o
 obj-y += page-alloc.o
 obj-y += init-mm.o
 obj-y += memblock.o
+obj-y += copy_page.o
+obj-y += copy_accel.o
+
+obj-y += exchange_page.o
+obj-y += exchange.o
+obj-y += memory_manage.o
 
 ifdef CONFIG_MMU
 	obj-$(CONFIG_ADVISE_SYSCALLS)	+= madvise.o

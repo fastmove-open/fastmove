@@ -19,6 +19,7 @@
 #include <linux/uio.h>
 #include <linux/uaccess.h>
 #include <linux/falloc.h>
+#include <linux/copy_accel.h>
 #include <asm/mman.h>
 #include "nova.h"
 #include "inode.h"
@@ -367,7 +368,6 @@ static struct iomap_ops nova_iomap_ops_nolock = {
 static ssize_t nova_dax_read_iter(struct kiocb *iocb, struct iov_iter *to)
 {
 	struct inode *inode = iocb->ki_filp->f_mapping->host;
-	struct nova_sb_info *sbi = NOVA_SB(inode->i_sb);
 	ssize_t ret;
 	INIT_TIMING(read_iter_time);
 
@@ -376,7 +376,18 @@ static ssize_t nova_dax_read_iter(struct kiocb *iocb, struct iov_iter *to)
 
 	NOVA_START_TIMING(read_iter_t, read_iter_time);
 	inode_lock_shared(inode);
-	ret = copy_iomap_rw_sync(iocb , to, &nova_iomap_ops_nolock);
+
+	switch(sysctl_fastmove.mode){
+	case SYSCTL_FASTMOVE_DMA:
+		ret = dax_iomap_rw_fastmove(iocb , to, &nova_iomap_ops_nolock);
+		break;
+	case SYSCTL_FASTMOVE_CPU:
+	case SYSCTL_FASTMOVE_DM:
+	default:
+		ret = dax_iomap_rw(iocb, to, &nova_iomap_ops_nolock);
+		break;
+	}
+
 	inode_unlock_shared(inode);
 
 	file_accessed(iocb->ki_filp);
@@ -413,7 +424,6 @@ static ssize_t nova_dax_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	struct file *file = iocb->ki_filp;
 	struct inode *inode = file->f_mapping->host;
 	struct super_block *sb = inode->i_sb;
-	struct nova_sb_info *sbi = NOVA_SB(sb);
 	struct nova_inode_info *si = NOVA_I(inode);
 	struct nova_inode_info_header *sih = &si->header;
 	loff_t offset;
@@ -437,7 +447,18 @@ static ssize_t nova_dax_write_iter(struct kiocb *iocb, struct iov_iter *from)
 
 	count = iov_iter_count(from);
 	offset = iocb->ki_pos;
-	ret = copy_iomap_rw_sync(iocb, from, &nova_iomap_ops_nolock);
+
+	switch(sysctl_fastmove.mode){
+	case SYSCTL_FASTMOVE_DMA:
+		ret = dax_iomap_rw_fastmove(iocb, from, &nova_iomap_ops_nolock);
+		break;
+	case SYSCTL_FASTMOVE_CPU:
+	case SYSCTL_FASTMOVE_DM:
+	default:
+		ret = dax_iomap_rw(iocb, from, &nova_iomap_ops_nolock);
+		break;
+	}
+
 	if (ret > 0 && iocb->ki_pos > i_size_read(inode)) {
 		i_size_write(inode, iocb->ki_pos);
 		sih->i_size = iocb->ki_pos;
@@ -563,12 +584,19 @@ skip_verify:
 		NOVA_START_TIMING(memcpy_r_nvmm_t, memcpy_time);
 
 		if (!zero){
-			// left = __copy_to_user(buf + copied,
-			// 			dax_mem + offset, nr);
-			left = dma_copy_to_user(sb->s_bdev, buf + copied, dax_mem + offset, nr, false);
+			switch(sysctl_fastmove.mode){
+			case SYSCTL_FASTMOVE_DMA:
+				left = memcpy_mcsafe_fastmove(sb->s_bdev, buf + copied, dax_mem + offset, nr, false);
+				break;
+			case SYSCTL_FASTMOVE_CPU:
+			case SYSCTL_FASTMOVE_DM:
+			default:
+				left = __copy_to_user(buf + copied, dax_mem + offset, nr);
+				break;
+			}
 		}else{
 			left = __clear_user(buf + copied, nr);
-		}
+		}			
 
 		NOVA_END_TIMING(memcpy_r_nvmm_t, memcpy_time);
 

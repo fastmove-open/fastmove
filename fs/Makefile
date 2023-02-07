@@ -54,7 +54,7 @@ obj-$(CONFIG_COREDUMP)		+= coredump.o
 obj-$(CONFIG_SYSCTL)		+= drop_caches.o
 
 obj-$(CONFIG_FHANDLE)		+= fhandle.o
-obj-$(CONFIG_COPY_ACCEL)		+= copy_accel.o
+obj-$(CONFIG_COPY_ACCEL)	+= copy_accel.o
 obj-y				+= iomap/
 
 obj-y				+= quota/
@@ -121,6 +121,7 @@ obj-$(CONFIG_JFS_FS)		+= jfs/
 obj-$(CONFIG_XFS_FS)		+= xfs/
 obj-$(CONFIG_9P_FS)		+= 9p/
 obj-$(CONFIG_NOVA_FS)		+= nova/
+obj-$(CONFIG_NOVA_DM_FS)	+= nova_dm/
 obj-$(CONFIG_AFS_FS)		+= afs/
 obj-$(CONFIG_NILFS2_FS)		+= nilfs2/
 obj-$(CONFIG_BEFS_FS)		+= befs/

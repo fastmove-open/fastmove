@@ -28,12 +28,13 @@ enum {
 /* Flags for set_mempolicy */
 #define MPOL_F_STATIC_NODES	(1 << 15)
 #define MPOL_F_RELATIVE_NODES	(1 << 14)
+#define MPOL_F_MEMCG		(1 << 13)
 
 /*
  * MPOL_MODE_FLAGS is the union of all possible optional mode flags passed to
  * either set_mempolicy() or mbind().
  */
-#define MPOL_MODE_FLAGS	(MPOL_F_STATIC_NODES | MPOL_F_RELATIVE_NODES)
+#define MPOL_MODE_FLAGS	(MPOL_F_STATIC_NODES | MPOL_F_RELATIVE_NODES | MPOL_F_MEMCG)
 
 /* Flags for get_mempolicy */
 #define MPOL_F_NODE	(1<<0)	/* return next IL mode instead of node mask */
@@ -47,6 +48,13 @@ enum {
 #define MPOL_MF_MOVE_ALL (1<<2)	/* Move every page to conform to policy */
 #define MPOL_MF_LAZY	 (1<<3)	/* Modifies '_MOVE:  lazy migrate on fault */
 #define MPOL_MF_INTERNAL (1<<4)	/* Internal flags start here */
+
+#define MPOL_MF_MOVE_DMA (1<<5)	/* Use DMA page copy routine */
+#define MPOL_MF_MOVE_MT  (1<<6)	/* Use multi-threaded page copy routine */
+#define MPOL_MF_MOVE_CONCUR  (1<<7)	/* Move pages in a batch */
+#define MPOL_MF_EXCHANGE	(1<<8)	/* Exchange pages */
+#define MPOL_MF_SHRINK_LISTS	(1<<9)	/* Exchange pages */
+#define MPOL_MF_MOVE_FM (1<<10)	/* Use fastmove page copy routine */
 
 #define MPOL_MF_VALID	(MPOL_MF_STRICT   | 	\
 			 MPOL_MF_MOVE     | 	\

@@ -49,6 +49,7 @@
 #include <linux/sched/mm.h>
 #include <linux/ptrace.h>
 #include <linux/oom.h>
+#include <linux/copy_accel.h>
 
 #include <asm/tlbflush.h>
 
@@ -56,6 +57,17 @@
 #include <trace/events/migrate.h>
 
 #include "internal.h"
+
+int accel_page_copy = 1;
+
+
+struct page_migration_work_item {
+	struct list_head list;
+	struct page *old_page;
+	struct page *new_page;
+	struct anon_vma *anon_vma;
+	int page_was_mapped;
+};
 
 /*
  * migrate_prep() needs to be called before we start compiling a list of pages
@@ -220,7 +232,7 @@ static bool remove_migration_pte(struct page *page, struct vm_area_struct *vma,
 		if (PageKsm(page))
 			new = page;
 		else
-			new = page - pvmw.page->index +
+			new = page - page->index +
 				linear_page_index(vma, pvmw.address);
 
 #ifdef CONFIG_ARCH_ENABLE_THP_MIGRATION
@@ -344,9 +356,19 @@ out:
 void migration_entry_wait(struct mm_struct *mm, pmd_t *pmd,
 				unsigned long address)
 {
+	unsigned long enter_jiffies = jiffies;
+	struct task_struct *tsk;
+
 	spinlock_t *ptl = pte_lockptr(mm, pmd);
 	pte_t *ptep = pte_offset_map(pmd, address);
 	__migration_entry_wait(mm, ptep, ptl);
+
+	enter_jiffies = jiffies - enter_jiffies;
+	rcu_read_lock();
+	tsk = rcu_dereference(mm->owner);
+	rcu_read_unlock();
+	tsk->page_migration_stats.base_page_under_migration_jiffies +=
+		enter_jiffies;
 }
 
 void migration_entry_wait_huge(struct vm_area_struct *vma,
@@ -361,6 +383,8 @@ void pmd_migration_entry_wait(struct mm_struct *mm, pmd_t *pmd)
 {
 	spinlock_t *ptl;
 	struct page *page;
+	unsigned long enter_jiffies = jiffies;
+	struct task_struct *tsk;
 
 	ptl = pmd_lock(mm, pmd);
 	if (!is_pmd_migration_entry(*pmd))
@@ -370,9 +394,23 @@ void pmd_migration_entry_wait(struct mm_struct *mm, pmd_t *pmd)
 		goto unlock;
 	spin_unlock(ptl);
 	put_and_wait_on_page_locked(page);
+
+	enter_jiffies = jiffies - enter_jiffies;
+	rcu_read_lock();
+	tsk = rcu_dereference(mm->owner);
+	rcu_read_unlock();
+	tsk->page_migration_stats.huge_page_under_migration_jiffies +=
+		enter_jiffies;
 	return;
 unlock:
 	spin_unlock(ptl);
+
+	enter_jiffies = jiffies - enter_jiffies;
+	rcu_read_lock();
+	tsk = rcu_dereference(mm->owner);
+	rcu_read_unlock();
+	tsk->page_migration_stats.huge_page_under_migration_jiffies +=
+		enter_jiffies;
 }
 #endif
 
@@ -558,15 +596,23 @@ int migrate_huge_page_move_mapping(struct address_space *mapping,
  * specialized.
  */
 static void __copy_gigantic_page(struct page *dst, struct page *src,
-				int nr_pages)
+				int nr_pages, enum migrate_mode mode)
 {
 	int i;
 	struct page *dst_base = dst;
 	struct page *src_base = src;
+	int rc = -EFAULT;
 
 	for (i = 0; i < nr_pages; ) {
 		cond_resched();
-		copy_highpage(dst, src);
+
+		if (mode & MIGRATE_DMA)
+			rc = copy_page_dma(dst, src, 1);
+		else if (mode & MIGRATE_FM)
+			rc = copy_page_fastmove(dst, src, 1);
+
+		if (rc)
+			copy_highpage(dst, src);
 
 		i++;
 		dst = mem_map_next(dst, dst_base, i);
@@ -574,10 +620,12 @@ static void __copy_gigantic_page(struct page *dst, struct page *src,
 	}
 }
 
-static void copy_huge_page(struct page *dst, struct page *src)
+static void copy_huge_page(struct page *dst, struct page *src,
+				enum migrate_mode mode)
 {
 	int i;
 	int nr_pages;
+	int rc = -EFAULT;
 
 	if (PageHuge(src)) {
 		/* hugetlbfs page */
@@ -585,7 +633,7 @@ static void copy_huge_page(struct page *dst, struct page *src)
 		nr_pages = pages_per_huge_page(h);
 
 		if (unlikely(nr_pages > MAX_ORDER_NR_PAGES)) {
-			__copy_gigantic_page(dst, src, nr_pages);
+			__copy_gigantic_page(dst, src, nr_pages, mode);
 			return;
 		}
 	} else {
@@ -594,10 +642,22 @@ static void copy_huge_page(struct page *dst, struct page *src)
 		nr_pages = thp_nr_pages(src);
 	}
 
-	for (i = 0; i < nr_pages; i++) {
-		cond_resched();
-		copy_highpage(dst + i, src + i);
-	}
+	/* Try to accelerate page migration if it is not specified in mode  */
+	// if (accel_page_copy)
+	// 	mode |= MIGRATE_MT;
+
+	if (mode & MIGRATE_MT)
+		rc = copy_page_multithread(dst, src, nr_pages);
+	else if (mode & MIGRATE_DMA)
+		rc = copy_page_dma(dst, src, nr_pages);
+	else if (mode & MIGRATE_FM)
+		rc = copy_page_fastmove(dst, src, nr_pages);
+
+	if (rc)
+		for (i = 0; i < nr_pages; i++) {
+			cond_resched();
+			copy_highpage(dst + i, src + i);
+		}
 }
 
 /*
@@ -673,12 +733,24 @@ void migrate_page_states(struct page *newpage, struct page *page)
 }
 EXPORT_SYMBOL(migrate_page_states);
 
-void migrate_page_copy(struct page *newpage, struct page *page)
+void migrate_page_copy(struct page *newpage, struct page *page,
+		enum migrate_mode mode)
 {
+	int rc = -EFAULT;
+
 	if (PageHuge(page) || PageTransHuge(page))
-		copy_huge_page(newpage, page);
-	else
-		copy_highpage(newpage, page);
+		copy_huge_page(newpage, page, mode);
+	else {
+		if (mode & MIGRATE_MT)
+			rc = copy_page_multithread(newpage, page, 1);
+		else if (mode & MIGRATE_DMA)
+			rc = copy_page_dma(newpage, page, 1);
+		else if (mode & MIGRATE_FM)
+			rc = copy_page_fastmove(newpage, page, 1);
+
+		if (rc)
+			copy_highpage(newpage, page);
+	}
 
 	migrate_page_states(newpage, page);
 }
@@ -699,31 +771,49 @@ int migrate_page(struct address_space *mapping,
 		enum migrate_mode mode)
 {
 	int rc;
+#ifdef CONFIG_PAGE_MIGRATION_PROFILE
+	u64 timestamp;
+#endif
 
 	BUG_ON(PageWriteback(page));	/* Writeback must be complete */
 
 	rc = migrate_page_move_mapping(mapping, newpage, page, 0);
 
+#ifdef CONFIG_PAGE_MIGRATION_PROFILE
+	timestamp = rdtsc();
+	current->move_pages_breakdown.change_page_mapping_cycles += timestamp -
+		current->move_pages_breakdown.last_timestamp;
+	current->move_pages_breakdown.last_timestamp = timestamp;
+#endif
+
 	if (rc != MIGRATEPAGE_SUCCESS)
 		return rc;
 
-	if (mode != MIGRATE_SYNC_NO_COPY)
-		migrate_page_copy(newpage, page);
+	if (!(mode & MIGRATE_SYNC_NO_COPY))
+		migrate_page_copy(newpage, page, mode);
 	else
 		migrate_page_states(newpage, page);
+
+#ifdef CONFIG_PAGE_MIGRATION_PROFILE
+	timestamp = rdtsc();
+	current->move_pages_breakdown.copy_page_cycles += timestamp -
+		current->move_pages_breakdown.last_timestamp;
+	current->move_pages_breakdown.last_timestamp = timestamp;
+#endif
+
 	return MIGRATEPAGE_SUCCESS;
 }
 EXPORT_SYMBOL(migrate_page);
 
 #ifdef CONFIG_BLOCK
 /* Returns true if all buffers are successfully locked */
-static bool buffer_migrate_lock_buffers(struct buffer_head *head,
+bool buffer_migrate_lock_buffers(struct buffer_head *head,
 							enum migrate_mode mode)
 {
 	struct buffer_head *bh = head;
 
 	/* Simple case, sync compaction */
-	if (mode != MIGRATE_ASYNC) {
+	if ((mode & MIGRATE_MODE_MASK)!= MIGRATE_ASYNC) {
 		do {
 			lock_buffer(bh);
 			bh = bh->b_this_page;
@@ -814,8 +904,8 @@ recheck_buffers:
 
 	} while (bh != head);
 
-	if (mode != MIGRATE_SYNC_NO_COPY)
-		migrate_page_copy(newpage, page);
+	if (!(mode & MIGRATE_SYNC_NO_COPY))
+		migrate_page_copy(newpage, page, MIGRATE_SINGLETHREAD);
 	else
 		migrate_page_states(newpage, page);
 
@@ -861,7 +951,7 @@ int buffer_migrate_page_norefs(struct address_space *mapping,
 /*
  * Writeback a page to clean the dirty state
  */
-static int writeout(struct address_space *mapping, struct page *page)
+int writeout(struct address_space *mapping, struct page *page)
 {
 	struct writeback_control wbc = {
 		.sync_mode = WB_SYNC_NONE,
@@ -907,13 +997,9 @@ static int fallback_migrate_page(struct address_space *mapping,
 {
 	if (PageDirty(page)) {
 		/* Only writeback pages in full synchronous migration */
-		switch (mode) {
-		case MIGRATE_SYNC:
-		case MIGRATE_SYNC_NO_COPY:
-			break;
-		default:
+		if ((mode & MIGRATE_MODE_MASK) != MIGRATE_SYNC)
 			return -EBUSY;
-		}
+
 		return writeout(mapping, page);
 	}
 
@@ -923,7 +1009,7 @@ static int fallback_migrate_page(struct address_space *mapping,
 	 */
 	if (page_has_private(page) &&
 	    !try_to_release_page(page, GFP_KERNEL))
-		return mode == MIGRATE_SYNC ? -EAGAIN : -EBUSY;
+		return (mode & MIGRATE_MODE_MASK) == MIGRATE_SYNC ? -EAGAIN : -EBUSY;
 
 	return migrate_page(mapping, newpage, page, mode);
 }
@@ -1023,9 +1109,12 @@ static int __unmap_and_move(struct page *page, struct page *newpage,
 	int page_was_mapped = 0;
 	struct anon_vma *anon_vma = NULL;
 	bool is_lru = !__PageMovable(page);
+#ifdef CONFIG_PAGE_MIGRATION_PROFILE
+	u64 timestamp;
+#endif
 
 	if (!trylock_page(page)) {
-		if (!force || mode == MIGRATE_ASYNC)
+		if (!force || ((mode & MIGRATE_MODE_MASK) == MIGRATE_ASYNC))
 			goto out;
 
 		/*
@@ -1047,6 +1136,13 @@ static int __unmap_and_move(struct page *page, struct page *newpage,
 		lock_page(page);
 	}
 
+#ifdef CONFIG_PAGE_MIGRATION_PROFILE
+	timestamp = rdtsc();
+	current->move_pages_breakdown.lock_page_cycles += timestamp -
+		current->move_pages_breakdown.last_timestamp;
+	current->move_pages_breakdown.last_timestamp = timestamp;
+#endif
+
 	if (PageWriteback(page)) {
 		/*
 		 * Only in the case of a full synchronous migration is it
@@ -1054,11 +1150,7 @@ static int __unmap_and_move(struct page *page, struct page *newpage,
 		 * the retry loop is too short and in the sync-light case,
 		 * the overhead of stalling is too much
 		 */
-		switch (mode) {
-		case MIGRATE_SYNC:
-		case MIGRATE_SYNC_NO_COPY:
-			break;
-		default:
+		if ((mode & MIGRATE_MODE_MASK) != MIGRATE_SYNC) {
 			rc = -EBUSY;
 			goto out_unlock;
 		}
@@ -1127,12 +1219,26 @@ static int __unmap_and_move(struct page *page, struct page *newpage,
 		page_was_mapped = 1;
 	}
 
+#ifdef CONFIG_PAGE_MIGRATION_PROFILE
+	timestamp = rdtsc();
+	current->move_pages_breakdown.unmap_page_cycles += timestamp -
+		current->move_pages_breakdown.last_timestamp;
+	current->move_pages_breakdown.last_timestamp = timestamp;
+#endif
+
 	if (!page_mapped(page))
 		rc = move_to_new_page(newpage, page, mode);
 
 	if (page_was_mapped)
 		remove_migration_ptes(page,
 			rc == MIGRATEPAGE_SUCCESS ? newpage : page, false);
+
+#ifdef CONFIG_PAGE_MIGRATION_PROFILE
+	timestamp = rdtsc();
+	current->move_pages_breakdown.remove_migration_ptes_cycles += timestamp -
+		current->move_pages_breakdown.last_timestamp;
+	current->move_pages_breakdown.last_timestamp = timestamp;
+#endif
 
 out_unlock_both:
 	unlock_page(newpage);
@@ -1173,9 +1279,26 @@ static int unmap_and_move(new_page_t get_new_page,
 {
 	int rc = MIGRATEPAGE_SUCCESS;
 	struct page *newpage = NULL;
+#ifdef CONFIG_PAGE_MIGRATION_PROFILE
+	u64 timestamp;
+#endif
 
 	if (!thp_migration_supported() && PageTransHuge(page))
 		return -ENOMEM;
+
+#ifdef CONFIG_PAGE_MIGRATION_PROFILE
+	timestamp = rdtsc();
+	current->move_pages_breakdown.enter_unmap_and_move_cycles += timestamp -
+		current->move_pages_breakdown.last_timestamp;
+	current->move_pages_breakdown.last_timestamp = timestamp;
+#endif
+
+#ifdef CONFIG_PAGE_MIGRATION_PROFILE
+	timestamp = rdtsc();
+	current->move_pages_breakdown.get_new_page_cycles += timestamp -
+		current->move_pages_breakdown.last_timestamp;
+	current->move_pages_breakdown.last_timestamp = timestamp;
+#endif
 
 	if (page_count(page) == 1) {
 		/* page was freed from under us. So we are done. */
@@ -1187,6 +1310,21 @@ static int unmap_and_move(new_page_t get_new_page,
 				__ClearPageIsolated(page);
 			unlock_page(page);
 		}
+
+#ifdef CONFIG_PAGE_MIGRATION_PROFILE
+		timestamp = rdtsc();
+		current->move_pages_breakdown.putback_old_page_cycles += timestamp -
+			current->move_pages_breakdown.last_timestamp;
+		current->move_pages_breakdown.last_timestamp = timestamp;
+#endif
+
+#ifdef CONFIG_PAGE_MIGRATION_PROFILE
+		timestamp = rdtsc();
+		current->move_pages_breakdown.putback_new_page_cycles += timestamp -
+			current->move_pages_breakdown.last_timestamp;
+		current->move_pages_breakdown.last_timestamp = timestamp;
+#endif
+
 		goto out;
 	}
 
@@ -1233,6 +1371,14 @@ out:
 			if (set_hwpoison_free_buddy_page(page))
 				num_poisoned_pages_inc();
 		}
+
+#ifdef CONFIG_PAGE_MIGRATION_PROFILE
+		timestamp = rdtsc();
+		current->move_pages_breakdown.putback_old_page_cycles += timestamp -
+			current->move_pages_breakdown.last_timestamp;
+		current->move_pages_breakdown.last_timestamp = timestamp;
+#endif
+
 	} else {
 		if (rc != -EAGAIN) {
 			if (likely(!__PageMovable(page))) {
@@ -1248,11 +1394,27 @@ out:
 			unlock_page(page);
 			put_page(page);
 		}
+
+#ifdef CONFIG_PAGE_MIGRATION_PROFILE
+		timestamp = rdtsc();
+		current->move_pages_breakdown.putback_old_page_cycles += timestamp -
+			current->move_pages_breakdown.last_timestamp;
+		current->move_pages_breakdown.last_timestamp = timestamp;
+#endif
+
 put_new:
 		if (put_new_page)
 			put_new_page(newpage, private);
 		else
 			put_page(newpage);
+
+#ifdef CONFIG_PAGE_MIGRATION_PROFILE
+		timestamp = rdtsc();
+		current->move_pages_breakdown.putback_new_page_cycles += timestamp -
+			current->move_pages_breakdown.last_timestamp;
+		current->move_pages_breakdown.last_timestamp = timestamp;
+#endif
+
 	}
 
 	return rc;
@@ -1304,15 +1466,9 @@ static int unmap_and_move_huge_page(new_page_t get_new_page,
 		return -ENOMEM;
 
 	if (!trylock_page(hpage)) {
-		if (!force)
+		if (!force || ((mode & MIGRATE_MODE_MASK) != MIGRATE_SYNC))
 			goto out;
-		switch (mode) {
-		case MIGRATE_SYNC:
-		case MIGRATE_SYNC_NO_COPY:
-			break;
-		default:
-			goto out;
-		}
+
 		lock_page(hpage);
 	}
 
@@ -1393,6 +1549,634 @@ out:
 	return rc;
 }
 
+static int __unmap_page_concur(struct page *page, struct page *newpage,
+				struct anon_vma **anon_vma,
+				int *page_was_mapped,
+				int force, enum migrate_mode mode)
+{
+	int rc = -EAGAIN;
+	bool is_lru = !__PageMovable(page);
+#ifdef CONFIG_PAGE_MIGRATION_PROFILE
+	u64 timestamp;
+#endif
+
+	*anon_vma = NULL;
+	*page_was_mapped = 0;
+
+	if (!trylock_page(page)) {
+		if (!force || ((mode & MIGRATE_MODE_MASK) == MIGRATE_ASYNC))
+			goto out;
+
+		/*
+		 * It's not safe for direct compaction to call lock_page.
+		 * For example, during page readahead pages are added locked
+		 * to the LRU. Later, when the IO completes the pages are
+		 * marked uptodate and unlocked. However, the queueing
+		 * could be merging multiple pages for one bio (e.g.
+		 * mpage_readpages). If an allocation happens for the
+		 * second or third page, the process can end up locking
+		 * the same page twice and deadlocking. Rather than
+		 * trying to be clever about what pages can be locked,
+		 * avoid the use of lock_page for direct compaction
+		 * altogether.
+		 */
+		if (current->flags & PF_MEMALLOC)
+			goto out;
+
+		lock_page(page);
+	}
+
+	/* We are working on page_mapping(page) == NULL */
+	VM_BUG_ON_PAGE(PageWriteback(page), page);
+#if 0
+	if (PageWriteback(page)) {
+		/*
+		 * Only in the case of a full synchronous migration is it
+		 * necessary to wait for PageWriteback. In the async case,
+		 * the retry loop is too short and in the sync-light case,
+		 * the overhead of stalling is too much
+		 */
+		if ((mode & MIGRATE_MODE_MASK) != MIGRATE_SYNC) {
+			rc = -EBUSY;
+			goto out_unlock;
+		}
+		if (!force)
+			goto out_unlock;
+		wait_on_page_writeback(page);
+	}
+#endif
+
+	/*
+	 * By try_to_unmap(), page->mapcount goes down to 0 here. In this case,
+	 * we cannot notice that anon_vma is freed while we migrates a page.
+	 * This get_anon_vma() delays freeing anon_vma pointer until the end
+	 * of migration. File cache pages are no problem because of page_lock()
+	 * File Caches may use write_page() or lock_page() in migration, then,
+	 * just care Anon page here.
+	 *
+	 * Only page_get_anon_vma() understands the subtleties of
+	 * getting a hold on an anon_vma from outside one of its mms.
+	 * But if we cannot get anon_vma, then we won't need it anyway,
+	 * because that implies that the anon page is no longer mapped
+	 * (and cannot be remapped so long as we hold the page lock).
+	 */
+	if (PageAnon(page) && !PageKsm(page))
+		*anon_vma = page_get_anon_vma(page);
+
+	/*
+	 * Block others from accessing the new page when we get around to
+	 * establishing additional references. We are usually the only one
+	 * holding a reference to newpage at this point. We used to have a BUG
+	 * here if trylock_page(newpage) fails, but would like to allow for
+	 * cases where there might be a race with the previous use of newpage.
+	 * This is much like races on refcount of oldpage: just don't BUG().
+	 */
+	if (unlikely(!trylock_page(newpage)))
+		goto out_unlock;
+
+	if (unlikely(!is_lru)) {
+		/* Just migrate the page and remove it from item list */
+		VM_BUG_ON(1);
+		rc = move_to_new_page(newpage, page, mode);
+		goto out_unlock_both;
+	}
+
+#ifdef CONFIG_PAGE_MIGRATION_PROFILE
+	timestamp = rdtsc();
+	current->move_pages_breakdown.lock_page_cycles += timestamp -
+		current->move_pages_breakdown.last_timestamp;
+	current->move_pages_breakdown.last_timestamp = timestamp;
+#endif
+
+	/*
+	 * Corner case handling:
+	 * 1. When a new swap-cache page is read into, it is added to the LRU
+	 * and treated as swapcache but it has no rmap yet.
+	 * Calling try_to_unmap() against a page->mapping==NULL page will
+	 * trigger a BUG.  So handle it here.
+	 * 2. An orphaned page (see truncate_complete_page) might have
+	 * fs-private metadata. The page can be picked up due to memory
+	 * offlining.  Everywhere else except page reclaim, the page is
+	 * invisible to the vm, so the page can not be migrated.  So try to
+	 * free the metadata, so the page can be freed.
+	 */
+	if (!page->mapping) {
+		VM_BUG_ON_PAGE(PageAnon(page), page);
+		if (page_has_private(page)) {
+			try_to_free_buffers(page);
+			goto out_unlock_both;
+		}
+	} else if (page_mapped(page)) {
+		/* Establish migration ptes */
+		VM_BUG_ON_PAGE(PageAnon(page) && !PageKsm(page) && !*anon_vma,
+				page);
+		try_to_unmap(page,
+			TTU_MIGRATION|TTU_IGNORE_MLOCK|TTU_IGNORE_ACCESS);
+		*page_was_mapped = 1;
+	}
+
+#ifdef CONFIG_PAGE_MIGRATION_PROFILE
+	timestamp = rdtsc();
+	current->move_pages_breakdown.unmap_page_cycles += timestamp -
+		current->move_pages_breakdown.last_timestamp;
+	current->move_pages_breakdown.last_timestamp = timestamp;
+#endif
+
+	return MIGRATEPAGE_SUCCESS;
+
+out_unlock_both:
+	unlock_page(newpage);
+out_unlock:
+	/* Drop an anon_vma reference if we took one */
+	if (*anon_vma)
+		put_anon_vma(*anon_vma);
+	unlock_page(page);
+out:
+	return rc;
+}
+
+static int unmap_pages_and_get_new_concur(new_page_t get_new_page,
+				free_page_t put_new_page, unsigned long private,
+				struct page_migration_work_item *item,
+				int force,
+				enum migrate_mode mode, enum migrate_reason reason)
+{
+	int rc = MIGRATEPAGE_SUCCESS;
+#ifdef CONFIG_PAGE_MIGRATION_PROFILE
+	u64 timestamp;
+#endif
+
+	if (!thp_migration_supported() && PageTransHuge(item->old_page))
+		return -ENOMEM;
+
+	item->new_page = get_new_page(item->old_page, private);
+	if (!item->new_page)
+		return -ENOMEM;
+
+#ifdef CONFIG_PAGE_MIGRATION_PROFILE
+	timestamp = rdtsc();
+	current->move_pages_breakdown.get_new_page_cycles += timestamp -
+		current->move_pages_breakdown.last_timestamp;
+	current->move_pages_breakdown.last_timestamp = timestamp;
+#endif
+
+	if (page_count(item->old_page) == 1) {
+		/* page was freed from under us. So we are done. */
+		ClearPageActive(item->old_page);
+		ClearPageUnevictable(item->old_page);
+		if (unlikely(__PageMovable(item->old_page))) {
+			lock_page(item->old_page);
+			if (!PageMovable(item->old_page))
+				__ClearPageIsolated(item->old_page);
+			unlock_page(item->old_page);
+		}
+
+		if (put_new_page)
+			put_new_page(item->new_page, private);
+		else
+			put_page(item->new_page);
+		item->new_page = NULL;
+
+#ifdef CONFIG_PAGE_MIGRATION_PROFILE
+		timestamp = rdtsc();
+		current->move_pages_breakdown.putback_new_page_cycles += timestamp -
+			current->move_pages_breakdown.last_timestamp;
+		current->move_pages_breakdown.last_timestamp = timestamp;
+#endif
+		goto out;
+	}
+
+	rc = __unmap_page_concur(item->old_page, item->new_page, &item->anon_vma,
+							&item->page_was_mapped,
+							force, mode);
+	if (rc == MIGRATEPAGE_SUCCESS)
+		return rc;
+
+out:
+	if (rc != -EAGAIN) {
+		list_del(&item->old_page->lru);
+
+		if (likely(!__PageMovable(item->old_page)))
+			mod_node_page_state(page_pgdat(item->old_page), NR_ISOLATED_ANON +
+					page_is_file_lru(item->old_page),
+					-thp_nr_pages(item->old_page));
+	}
+
+	if (rc == MIGRATEPAGE_SUCCESS) {
+		/* only for pages freed under us  */
+		VM_BUG_ON(page_count(item->old_page) != 1);
+		put_page(item->old_page);
+		item->old_page = NULL;
+
+#ifdef CONFIG_PAGE_MIGRATION_PROFILE
+		timestamp = rdtsc();
+		current->move_pages_breakdown.putback_old_page_cycles += timestamp -
+			current->move_pages_breakdown.last_timestamp;
+		current->move_pages_breakdown.last_timestamp = timestamp;
+#endif
+	} else {
+		if (rc != -EAGAIN) {
+			if (likely(!__PageMovable(item->old_page))) {
+				putback_lru_page(item->old_page);
+				goto put_new;
+			}
+
+			lock_page(item->old_page);
+			if (PageMovable(item->old_page))
+				putback_movable_page(item->old_page);
+			else
+				__ClearPageIsolated(item->old_page);
+			unlock_page(item->old_page);
+			put_page(item->old_page);
+		}
+
+#ifdef CONFIG_PAGE_MIGRATION_PROFILE
+		timestamp = rdtsc();
+		current->move_pages_breakdown.putback_old_page_cycles += timestamp -
+			current->move_pages_breakdown.last_timestamp;
+		current->move_pages_breakdown.last_timestamp = timestamp;
+#endif
+
+		/*
+		 * If migration was not successful and there's a freeing callback, use
+		 * it.  Otherwise, putback_lru_page() will drop the reference grabbed
+		 * during isolation.
+		 */
+put_new:
+		if (put_new_page)
+			put_new_page(item->new_page, private);
+		else
+			put_page(item->new_page);
+		item->new_page = NULL;
+
+#ifdef CONFIG_PAGE_MIGRATION_PROFILE
+		timestamp = rdtsc();
+		current->move_pages_breakdown.putback_new_page_cycles += timestamp -
+			current->move_pages_breakdown.last_timestamp;
+		current->move_pages_breakdown.last_timestamp = timestamp;
+#endif
+	}
+	return rc;
+}
+
+static int move_mapping_concurr(struct list_head *unmapped_list_ptr,
+					   struct list_head *wip_list_ptr,
+					   free_page_t put_new_page, unsigned long private,
+					   enum migrate_mode mode)
+{
+	struct page_migration_work_item *iterator, *iterator2;
+	struct address_space *mapping;
+
+	list_for_each_entry_safe(iterator, iterator2, unmapped_list_ptr, list) {
+		VM_BUG_ON_PAGE(!PageLocked(iterator->old_page), iterator->old_page);
+		VM_BUG_ON_PAGE(!PageLocked(iterator->new_page), iterator->new_page);
+
+		mapping = page_mapping(iterator->old_page);
+
+		VM_BUG_ON(mapping);
+
+		VM_BUG_ON(PageWriteback(iterator->old_page));
+
+		if (page_count(iterator->old_page) != 1) {
+			list_move(&iterator->list, wip_list_ptr);
+			if (iterator->page_was_mapped)
+				remove_migration_ptes(iterator->old_page,
+					iterator->old_page, false);
+			unlock_page(iterator->new_page);
+			if (iterator->anon_vma)
+				put_anon_vma(iterator->anon_vma);
+			unlock_page(iterator->old_page);
+
+			if (put_new_page)
+				put_new_page(iterator->new_page, private);
+			else
+				put_page(iterator->new_page);
+			iterator->new_page = NULL;
+			continue;
+		}
+
+		iterator->new_page->index = iterator->old_page->index;
+		iterator->new_page->mapping = iterator->old_page->mapping;
+		if (PageSwapBacked(iterator->old_page))
+			SetPageSwapBacked(iterator->new_page);
+	}
+
+	return 0;
+}
+
+static int copy_to_new_pages_concur(struct list_head *unmapped_list_ptr,
+				enum migrate_mode mode)
+{
+	struct page_migration_work_item *iterator;
+	int num_pages = 0, idx = 0;
+	struct page **src_page_list = NULL, **dst_page_list = NULL;
+	unsigned long size = 0;
+	int rc = -EFAULT;
+#ifdef CONFIG_PAGE_MIGRATION_PROFILE
+	u64 timestamp;
+#endif
+
+	if (list_empty(unmapped_list_ptr))
+		return 0;
+
+	list_for_each_entry(iterator, unmapped_list_ptr, list) {
+		++num_pages;
+		size += PAGE_SIZE * thp_nr_pages(iterator->old_page);
+	}
+
+	src_page_list = kzalloc(sizeof(struct page *)*num_pages, GFP_KERNEL);
+	if (!src_page_list) {
+		BUG();
+		return -ENOMEM;
+	}
+	dst_page_list = kzalloc(sizeof(struct page *)*num_pages, GFP_KERNEL);
+	if (!dst_page_list) {
+		BUG();
+		return -ENOMEM;
+	}
+
+	list_for_each_entry(iterator, unmapped_list_ptr, list) {
+		src_page_list[idx] = iterator->old_page;
+		dst_page_list[idx] = iterator->new_page;
+		++idx;
+	}
+
+	BUG_ON(idx != num_pages);
+
+#ifdef CONFIG_PAGE_MIGRATION_PROFILE
+	timestamp = rdtsc();
+	current->move_pages_breakdown.change_page_mapping_cycles += timestamp -
+		current->move_pages_breakdown.last_timestamp;
+	current->move_pages_breakdown.last_timestamp = timestamp;
+#endif
+
+	if (mode & MIGRATE_MT)
+		rc = copy_page_lists_mt(dst_page_list, src_page_list,
+							num_pages);
+	else if (mode & MIGRATE_DMA)
+		rc = copy_page_lists_dma_always(dst_page_list, src_page_list,
+							num_pages);
+	else if (mode & MIGRATE_FM)
+		rc = copy_page_lists_fastmove(dst_page_list, src_page_list,
+							num_pages);
+
+	if (rc) {
+		list_for_each_entry(iterator, unmapped_list_ptr, list) {
+			if (PageHuge(iterator->old_page) ||
+				PageTransHuge(iterator->old_page))
+				copy_huge_page(iterator->new_page, iterator->old_page, 0);
+			else
+				copy_highpage(iterator->new_page, iterator->old_page);
+		}
+	}
+
+	list_for_each_entry(iterator, unmapped_list_ptr, list) {
+		migrate_page_states(iterator->new_page, iterator->old_page);
+	}
+
+#ifdef CONFIG_PAGE_MIGRATION_PROFILE
+	timestamp = rdtsc();
+	current->move_pages_breakdown.copy_page_cycles += timestamp -
+		current->move_pages_breakdown.last_timestamp;
+	current->move_pages_breakdown.last_timestamp = timestamp;
+#endif
+
+	kfree(src_page_list);
+	kfree(dst_page_list);
+
+	return 0;
+}
+
+static int remove_migration_ptes_concurr(struct list_head *unmapped_list_ptr)
+{
+	struct page_migration_work_item *iterator, *iterator2;
+#ifdef CONFIG_PAGE_MIGRATION_PROFILE
+	u64 timestamp;
+#endif
+
+	list_for_each_entry_safe(iterator, iterator2, unmapped_list_ptr, list) {
+		if (iterator->page_was_mapped)
+			remove_migration_ptes(iterator->old_page, iterator->new_page, false);
+
+
+#ifdef CONFIG_PAGE_MIGRATION_PROFILE
+		timestamp = rdtsc();
+		current->move_pages_breakdown.remove_migration_ptes_cycles += timestamp -
+			current->move_pages_breakdown.last_timestamp;
+		current->move_pages_breakdown.last_timestamp = timestamp;
+#endif
+
+		unlock_page(iterator->new_page);
+
+		if (iterator->anon_vma)
+			put_anon_vma(iterator->anon_vma);
+
+		unlock_page(iterator->old_page);
+
+		list_del(&iterator->old_page->lru);
+		mod_node_page_state(page_pgdat(iterator->old_page), NR_ISOLATED_ANON +
+				page_is_file_lru(iterator->old_page),
+				-thp_nr_pages(iterator->old_page));
+
+		put_page(iterator->old_page);
+		iterator->old_page = NULL;
+
+#ifdef CONFIG_PAGE_MIGRATION_PROFILE
+		timestamp = rdtsc();
+		current->move_pages_breakdown.putback_old_page_cycles += timestamp -
+			current->move_pages_breakdown.last_timestamp;
+		current->move_pages_breakdown.last_timestamp = timestamp;
+#endif
+
+		if (unlikely(__PageMovable(iterator->new_page)))
+			put_page(iterator->new_page);
+		else
+			putback_lru_page(iterator->new_page);
+		iterator->new_page = NULL;
+
+#ifdef CONFIG_PAGE_MIGRATION_PROFILE
+		timestamp = rdtsc();
+		current->move_pages_breakdown.putback_new_page_cycles += timestamp -
+			current->move_pages_breakdown.last_timestamp;
+		current->move_pages_breakdown.last_timestamp = timestamp;
+#endif
+	}
+
+	return 0;
+}
+
+int migrate_pages_concur(struct list_head *from, new_page_t get_new_page,
+		free_page_t put_new_page, unsigned long private,
+		enum migrate_mode mode, int reason)
+{
+	int retry = 1;
+	int nr_failed = 0;
+	int nr_succeeded = 0;
+	int pass = 0;
+	struct page *page;
+	int swapwrite = current->flags & PF_SWAPWRITE;
+	int rc;
+	int total_num_pages = 0, idx;
+	struct page_migration_work_item *item_list;
+	struct page_migration_work_item *iterator, *iterator2;
+	int item_list_order = 0;
+#ifdef CONFIG_PAGE_MIGRATION_PROFILE
+	u64 timestamp;
+#endif
+
+	LIST_HEAD(wip_list);
+	LIST_HEAD(unmapped_list);
+	LIST_HEAD(serialized_list);
+	LIST_HEAD(failed_list);
+
+	if (!swapwrite)
+		current->flags |= PF_SWAPWRITE;
+
+	list_for_each_entry(page, from, lru)
+		++total_num_pages;
+
+	item_list_order = get_order(total_num_pages *
+		sizeof(struct page_migration_work_item));
+
+	if (item_list_order > MAX_ORDER) {
+		item_list = alloc_pages_exact(total_num_pages *
+			sizeof(struct page_migration_work_item), GFP_ATOMIC);
+		memset(item_list, 0, total_num_pages *
+			sizeof(struct page_migration_work_item));
+	} else {
+		item_list = (struct page_migration_work_item *)__get_free_pages(GFP_ATOMIC,
+						item_list_order);
+		memset(item_list, 0, PAGE_SIZE<<item_list_order);
+	}
+
+	idx = 0;
+	list_for_each_entry(page, from, lru) {
+		item_list[idx].old_page = page;
+		item_list[idx].new_page = NULL;
+		INIT_LIST_HEAD(&item_list[idx].list);
+		list_add_tail(&item_list[idx].list, &wip_list);
+		idx += 1;
+	}
+
+#ifdef CONFIG_PAGE_MIGRATION_PROFILE
+	timestamp = rdtsc();
+	current->move_pages_breakdown.enter_unmap_and_move_cycles += timestamp -
+		current->move_pages_breakdown.last_timestamp;
+	current->move_pages_breakdown.last_timestamp = timestamp;
+#endif
+
+	for(pass = 0; pass < 1 && retry; pass++) {
+		retry = 0;
+
+		/* unmap and get new page for page_mapping(page) == NULL */
+		list_for_each_entry_safe(iterator, iterator2, &wip_list, list) {
+			cond_resched();
+
+			if (iterator->new_page) {
+				pr_info("%s: iterator already has a new page?\n", __func__);
+				VM_BUG_ON_PAGE(1, iterator->old_page);
+			}
+
+			/* We do not migrate huge pages, file-backed, or swapcached pages */
+			if (PageHuge(iterator->old_page)) {
+				rc = -ENODEV;
+			}
+			else if ((page_mapping(iterator->old_page) != NULL)) {
+				rc = -ENODEV;
+			}
+			else
+				rc = unmap_pages_and_get_new_concur(get_new_page, put_new_page,
+						private, iterator, pass > 2, mode,
+						reason);
+
+			switch(rc) {
+			case -ENODEV:
+				list_move(&iterator->list, &serialized_list);
+				break;
+			case -ENOMEM:
+				if (PageTransHuge(page))
+					list_move(&iterator->list, &serialized_list);
+				else
+					goto out;
+				break;
+			case -EAGAIN:
+				retry++;
+				break;
+			case MIGRATEPAGE_SUCCESS:
+				if (iterator->old_page) {
+					list_move(&iterator->list, &unmapped_list);
+					nr_succeeded++;
+				} else { /* pages are freed under us */
+					list_del(&iterator->list);
+				}
+				break;
+			default:
+				/*
+				 * Permanent failure (-EBUSY, -ENOSYS, etc.):
+				 * unlike -EAGAIN case, the failed page is
+				 * removed from migration page list and not
+				 * retried in the next outer loop.
+				 */
+				list_move(&iterator->list, &failed_list);
+				nr_failed++;
+				break;
+			}
+		}
+out:
+		if (list_empty(&unmapped_list))
+			continue;
+
+#ifdef CONFIG_PAGE_MIGRATION_PROFILE
+		timestamp = rdtsc();
+		current->move_pages_breakdown.unmap_page_cycles += timestamp -
+			current->move_pages_breakdown.last_timestamp;
+		current->move_pages_breakdown.last_timestamp = timestamp;
+#endif
+
+		/* move page->mapping to new page, only -EAGAIN could happen  */
+		move_mapping_concurr(&unmapped_list, &wip_list, put_new_page, private, mode);
+
+		/* copy pages in unmapped_list */
+		copy_to_new_pages_concur(&unmapped_list, mode);
+
+		/* remove migration pte, if old_page is NULL?, unlock old and new
+		 * pages, put anon_vma, put old and new pages */
+		remove_migration_ptes_concurr(&unmapped_list);
+
+	}
+	nr_failed += retry;
+	rc = nr_failed;
+
+	if (!list_empty(from))
+		rc = migrate_pages(from, get_new_page, put_new_page,
+				private, mode, reason);
+
+	if (nr_succeeded)
+		count_vm_events(PGMIGRATE_SUCCESS, nr_succeeded);
+	if (nr_failed)
+		count_vm_events(PGMIGRATE_FAIL, nr_failed);
+	trace_mm_migrate_pages(nr_succeeded, nr_failed, 0, 0, 0, mode, reason);
+
+	if (item_list_order >= MAX_ORDER) {
+		free_pages_exact(item_list, total_num_pages *
+			sizeof(struct page_migration_work_item));
+	} else {
+		free_pages((unsigned long)item_list, item_list_order);
+	}
+
+	if (!swapwrite)
+		current->flags &= ~PF_SWAPWRITE;
+
+#ifdef CONFIG_PAGE_MIGRATION_PROFILE
+	timestamp = rdtsc();
+	current->move_pages_breakdown.migrate_pages_cleanup_cycles += timestamp -
+		current->move_pages_breakdown.last_timestamp;
+	current->move_pages_breakdown.last_timestamp = timestamp;
+#endif
+
+	return rc;
+}
+
 /*
  * migrate_pages - migrate the pages specified in a list, to the free pages
  *		   supplied as the target for the page migration
@@ -1431,6 +2215,9 @@ int migrate_pages(struct list_head *from, new_page_t get_new_page,
 	struct page *page2;
 	int swapwrite = current->flags & PF_SWAPWRITE;
 	int rc, nr_subpages;
+#ifdef CONFIG_PAGE_MIGRATION_PROFILE
+	u64 timestamp;
+#endif
 
 	if (!swapwrite)
 		current->flags |= PF_SWAPWRITE;
@@ -1476,6 +2263,14 @@ retry:
 					lock_page(page);
 					rc = split_huge_page_to_list(page, from);
 					unlock_page(page);
+
+#ifdef CONFIG_PAGE_MIGRATION_PROFILE
+					timestamp = rdtsc();
+					current->move_pages_breakdown.split_thp_page_cycles += timestamp -
+						current->move_pages_breakdown.last_timestamp;
+					current->move_pages_breakdown.last_timestamp = timestamp;
+#endif
+
 					if (!rc) {
 						list_safe_reset_next(page, page2, lru);
 						nr_thp_split++;
@@ -1534,6 +2329,13 @@ out:
 
 	if (!swapwrite)
 		current->flags &= ~PF_SWAPWRITE;
+
+#ifdef CONFIG_PAGE_MIGRATION_PROFILE
+	timestamp = rdtsc();
+	current->move_pages_breakdown.migrate_pages_cleanup_cycles += timestamp -
+		current->move_pages_breakdown.last_timestamp;
+	current->move_pages_breakdown.last_timestamp = timestamp;
+#endif
 
 	return rc;
 }
@@ -1595,7 +2397,8 @@ static int store_status(int __user *status, int start, int value, int nr)
 }
 
 static int do_move_pages_to_node(struct mm_struct *mm,
-		struct list_head *pagelist, int node)
+		struct list_head *pagelist, int node,
+		bool migrate_mt, bool migrate_dma, bool migrate_fm, bool migrate_concur)
 {
 	int err;
 	struct migration_target_control mtc = {
@@ -1603,8 +2406,20 @@ static int do_move_pages_to_node(struct mm_struct *mm,
 		.gfp_mask = GFP_HIGHUSER_MOVABLE | __GFP_THISNODE,
 	};
 
-	err = migrate_pages(pagelist, alloc_migration_target, NULL,
-			(unsigned long)&mtc, MIGRATE_SYNC, MR_SYSCALL);
+	if (migrate_concur) {
+		err = migrate_pages_concur(pagelist, alloc_migration_target, NULL, (unsigned long)&mtc,
+				MIGRATE_SYNC | (migrate_mt ? MIGRATE_MT : MIGRATE_SINGLETHREAD) |
+				(migrate_dma ? MIGRATE_DMA : MIGRATE_SINGLETHREAD) |
+				(migrate_fm ? MIGRATE_FM : MIGRATE_SINGLETHREAD),
+				MR_SYSCALL);
+
+	} else {
+		err = migrate_pages(pagelist, alloc_migration_target, NULL, (unsigned long)&mtc,
+				MIGRATE_SYNC | (migrate_mt ? MIGRATE_MT : MIGRATE_SINGLETHREAD) |
+				(migrate_dma ? MIGRATE_DMA : MIGRATE_SINGLETHREAD) |
+				(migrate_fm ? MIGRATE_FM : MIGRATE_SINGLETHREAD),
+				MR_SYSCALL);
+	}
 	if (err)
 		putback_movable_pages(pagelist);
 	return err;
@@ -1686,14 +2501,16 @@ out:
 
 static int move_pages_and_store_status(struct mm_struct *mm, int node,
 		struct list_head *pagelist, int __user *status,
-		int start, int i, unsigned long nr_pages)
+		int start, int i, unsigned long nr_pages, int flags)
 {
 	int err;
 
 	if (list_empty(pagelist))
 		return 0;
 
-	err = do_move_pages_to_node(mm, pagelist, node);
+	err = do_move_pages_to_node(mm, pagelist, node,
+				flags & MPOL_MF_MOVE_MT, flags & MPOL_MF_MOVE_DMA,
+				flags & MPOL_MF_MOVE_FM, flags & MPOL_MF_MOVE_CONCUR);
 	if (err) {
 		/*
 		 * Positive err means the number of failed
@@ -1724,8 +2541,20 @@ static int do_pages_move(struct mm_struct *mm, nodemask_t task_nodes,
 	LIST_HEAD(pagelist);
 	int start, i;
 	int err = 0, err1;
+#ifdef CONFIG_PAGE_MIGRATION_PROFILE
+	u64 timestamp;
+#endif
 
 	migrate_prep();
+
+#ifdef CONFIG_PAGE_MIGRATION_PROFILE
+	timestamp = rdtsc();
+	current->move_pages_breakdown.migrate_prep_cycles += timestamp -
+		current->move_pages_breakdown.last_timestamp;
+	current->move_pages_breakdown.last_timestamp = timestamp;
+#endif
+
+	down_read(&mm->mmap_lock);
 
 	for (i = start = 0; i < nr_pages; i++) {
 		const void __user *p;
@@ -1753,13 +2582,36 @@ static int do_pages_move(struct mm_struct *mm, nodemask_t task_nodes,
 			current_node = node;
 			start = i;
 		} else if (node != current_node) {
+
+#ifdef CONFIG_PAGE_MIGRATION_PROFILE
+			timestamp = rdtsc();
+			current->move_pages_breakdown.form_page_node_info_cycles += timestamp -
+				current->move_pages_breakdown.last_timestamp;
+			current->move_pages_breakdown.last_timestamp = timestamp;
+#endif
+
 			err = move_pages_and_store_status(mm, current_node,
-					&pagelist, status, start, i, nr_pages);
+					&pagelist, status, start, i, nr_pages, flags);
 			if (err)
 				goto out;
 			start = i;
 			current_node = node;
+
+#ifdef CONFIG_PAGE_MIGRATION_PROFILE
+			timestamp = rdtsc();
+			current->move_pages_breakdown.store_page_status_cycles += timestamp -
+				current->move_pages_breakdown.last_timestamp;
+			current->move_pages_breakdown.last_timestamp = timestamp;
+#endif
+
 		}
+
+#ifdef CONFIG_PAGE_MIGRATION_PROFILE
+		timestamp = rdtsc();
+		current->move_pages_breakdown.form_page_node_info_cycles += timestamp -
+			current->move_pages_breakdown.last_timestamp;
+		current->move_pages_breakdown.last_timestamp = timestamp;
+#endif
 
 		/*
 		 * Errors in the page lookup or isolation are not fatal and we simply
@@ -1767,6 +2619,13 @@ static int do_pages_move(struct mm_struct *mm, nodemask_t task_nodes,
 		 */
 		err = add_page_for_migration(mm, addr, current_node,
 				&pagelist, flags & MPOL_MF_MOVE_ALL);
+
+#ifdef CONFIG_PAGE_MIGRATION_PROFILE
+		timestamp = rdtsc();
+		current->move_pages_breakdown.form_physical_page_list_cycles += timestamp -
+			current->move_pages_breakdown.last_timestamp;
+		current->move_pages_breakdown.last_timestamp = timestamp;
+#endif
 
 		if (err > 0) {
 			/* The page is successfully queued for migration */
@@ -1781,18 +2640,49 @@ static int do_pages_move(struct mm_struct *mm, nodemask_t task_nodes,
 		if (err)
 			goto out_flush;
 
+#ifdef CONFIG_PAGE_MIGRATION_PROFILE
+		timestamp = rdtsc();
+		current->move_pages_breakdown.form_page_node_info_cycles += timestamp -
+			current->move_pages_breakdown.last_timestamp;
+		current->move_pages_breakdown.last_timestamp = timestamp;
+#endif
+
 		err = move_pages_and_store_status(mm, current_node, &pagelist,
-				status, start, i, nr_pages);
+				status, start, i, nr_pages, flags);
 		if (err)
 			goto out;
 		current_node = NUMA_NO_NODE;
+
+#ifdef CONFIG_PAGE_MIGRATION_PROFILE
+		timestamp = rdtsc();
+		current->move_pages_breakdown.store_page_status_cycles += timestamp -
+			current->move_pages_breakdown.last_timestamp;
+		current->move_pages_breakdown.last_timestamp = timestamp;
+#endif
+
 	}
 out_flush:
 	/* Make sure we do not overwrite the existing error */
+
+#ifdef CONFIG_PAGE_MIGRATION_PROFILE
+	timestamp = rdtsc();
+	current->move_pages_breakdown.form_page_node_info_cycles += timestamp -
+		current->move_pages_breakdown.last_timestamp;
+	current->move_pages_breakdown.last_timestamp = timestamp;
+#endif
+
 	err1 = move_pages_and_store_status(mm, current_node, &pagelist,
-				status, start, i, nr_pages);
+				status, start, i, nr_pages, flags);
 	if (err >= 0)
 		err = err1;
+
+#ifdef CONFIG_PAGE_MIGRATION_PROFILE
+	timestamp = rdtsc();
+	current->move_pages_breakdown.store_page_status_cycles += timestamp -
+		current->move_pages_breakdown.last_timestamp;
+	current->move_pages_breakdown.last_timestamp = timestamp;
+#endif
+
 out:
 	return err;
 }
@@ -1882,9 +2772,17 @@ static int kernel_move_pages(pid_t pid, unsigned long nr_pages,
 	struct mm_struct *mm;
 	int err;
 	nodemask_t task_nodes;
+#ifdef CONFIG_PAGE_MIGRATION_PROFILE
+	u64 timestamp = rdtsc();
+
+	current->move_pages_breakdown.syscall_timestamp += timestamp;
+	current->move_pages_breakdown.last_timestamp = timestamp;
+#endif
 
 	/* Check flags */
-	if (flags & ~(MPOL_MF_MOVE|MPOL_MF_MOVE_ALL))
+	if (flags & ~(MPOL_MF_MOVE|MPOL_MF_MOVE_ALL|
+				  MPOL_MF_MOVE_DMA|MPOL_MF_MOVE_FM|MPOL_MF_MOVE_MT|
+				  MPOL_MF_MOVE_CONCUR))
 		return -EINVAL;
 
 	if ((flags & MPOL_MF_MOVE_ALL) && !capable(CAP_SYS_NICE))
@@ -1921,6 +2819,13 @@ static int kernel_move_pages(pid_t pid, unsigned long nr_pages,
 	if (!mm)
 		return -EINVAL;
 
+#ifdef CONFIG_PAGE_MIGRATION_PROFILE
+	timestamp = rdtsc();
+	current->move_pages_breakdown.check_rights_cycles += timestamp -
+		current->move_pages_breakdown.last_timestamp;
+	current->move_pages_breakdown.last_timestamp = timestamp;
+#endif
+
 	if (nodes)
 		err = do_pages_move(mm, task_nodes, nr_pages, pages,
 				    nodes, status, flags);
@@ -1928,10 +2833,26 @@ static int kernel_move_pages(pid_t pid, unsigned long nr_pages,
 		err = do_pages_stat(mm, nr_pages, pages, status);
 
 	mmput(mm);
+
+#ifdef CONFIG_PAGE_MIGRATION_PROFILE
+	timestamp = rdtsc();
+	current->move_pages_breakdown.return_to_syscall_cycles += timestamp -
+		current->move_pages_breakdown.last_timestamp;
+	current->move_pages_breakdown.last_timestamp = timestamp;
+#endif
+
 	return err;
 
 out:
 	put_task_struct(task);
+
+#ifdef CONFIG_PAGE_MIGRATION_PROFILE
+	timestamp = rdtsc();
+	current->move_pages_breakdown.return_to_syscall_cycles += timestamp -
+		current->move_pages_breakdown.last_timestamp;
+	current->move_pages_breakdown.last_timestamp = timestamp;
+#endif
+
 	return err;
 }
 
@@ -2147,7 +3068,7 @@ int migrate_misplaced_transhuge_page(struct mm_struct *mm,
 	new_page->index = page->index;
 	/* flush the cache before copying using the kernel virtual address */
 	flush_cache_range(vma, start, start + HPAGE_PMD_SIZE);
-	migrate_page_copy(new_page, page);
+	migrate_page_copy(new_page, page, MIGRATE_SINGLETHREAD);
 	WARN_ON(PageLRU(new_page));
 
 	/* Recheck the target PMD */
@@ -3024,7 +3945,7 @@ void migrate_vma_pages(struct migrate_vma *migrate)
 			}
 		}
 
-		r = migrate_page(mapping, newpage, page, MIGRATE_SYNC_NO_COPY);
+		r = migrate_page(mapping, newpage, page, MIGRATE_SYNC | MIGRATE_SYNC_NO_COPY);
 		if (r != MIGRATEPAGE_SUCCESS)
 			migrate->src[i] &= ~MIGRATE_PFN_MIGRATE;
 	}

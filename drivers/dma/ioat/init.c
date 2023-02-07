@@ -583,6 +583,7 @@ static void ioat_enumerate_channels(struct ioatdma_device *ioat_dma)
 	if (xfercap_log == 0)
 		return;
 	dev_dbg(dev, "%s: xfercap = %d\n", __func__, 1 << xfercap_log);
+	dma->xfercap = 1 << xfercap_log;
 
 	for (i = 0; i < dma->chancnt; i++) {
 		ioat_chan = kzalloc(sizeof(*ioat_chan), GFP_KERNEL);
@@ -1098,6 +1099,7 @@ static int ioat3_dma_probe(struct ioatdma_device *ioat_dma, int dca)
 
 	dma = &ioat_dma->dma_dev;
 	dma->device_prep_dma_memcpy = ioat_dma_prep_memcpy_lock;
+	dma->device_prep_dma_memcpy_sg = ioat_dma_prep_memcpy_sg_lock;
 	dma->device_issue_pending = ioat_issue_pending;
 	dma->device_alloc_chan_resources = ioat_alloc_chan_resources;
 	dma->device_free_chan_resources = ioat_free_chan_resources;
@@ -1169,9 +1171,6 @@ static int ioat3_dma_probe(struct ioatdma_device *ioat_dma, int dca)
 
 		}
 	}
-
-	if (!(ioat_dma->cap & (IOAT_CAP_XOR | IOAT_CAP_PQ)))
-		dma_cap_set(DMA_PRIVATE, dma->cap_mask);
 
 	err = ioat_probe(ioat_dma);
 	if (err)

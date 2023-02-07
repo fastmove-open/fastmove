@@ -98,6 +98,9 @@ typedef int (*dm_report_zones_fn) (struct dm_target *ti,
 				   struct dm_report_zones_args *args,
 				   unsigned int nr_zones);
 
+typedef long (*dm_size_fn) (struct dm_target *ti, void ***virt_addr_list,
+                                pfn_t **pfn_list, int *size, struct block_device ***bdev_list);
+
 /*
  * These iteration functions are typically used to check (and combine)
  * properties of underlying devices.
@@ -198,6 +201,7 @@ struct target_type {
 	dm_dax_copy_iter_fn dax_copy_from_iter;
 	dm_dax_copy_iter_fn dax_copy_to_iter;
 	dm_dax_zero_page_range_fn dax_zero_page_range;
+	dm_size_fn dm_get_dax_size;
 
 	/* For internal device-mapper use. */
 	struct list_head list;

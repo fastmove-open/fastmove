@@ -302,6 +302,30 @@ static int stripe_map(struct dm_target *ti, struct bio *bio)
 }
 
 #if IS_ENABLED(CONFIG_DAX_DRIVER)
+static long stripe_get_total_size(struct dm_target *ti, void ***virt_addr_list,
+		pfn_t **pfn_list, int *size, struct block_device ***bdev_list)
+{
+	struct stripe_c *sc = ti->private;
+	long ret = 0;
+	int i;
+
+	int stripes = sc->stripes;
+
+	*size = stripes;
+	*virt_addr_list = kmalloc(sizeof(void *) * stripes, GFP_KERNEL);
+	*pfn_list = kmalloc(sizeof(pfn_t) * stripes, GFP_KERNEL);
+	*bdev_list = kmalloc(sizeof(struct block_device *) * stripes, GFP_KERNEL);
+
+	for (i = 0; i < stripes; i ++) {
+		ret += dax_direct_access(sc->stripe[i].dev->dax_dev, 0,
+			LONG_MAX / PAGE_SIZE, *virt_addr_list + i, *pfn_list + i);
+
+		(*bdev_list)[i] = sc->stripe[i].dev->bdev;
+	}
+
+	return ret;
+}
+
 static long stripe_dax_direct_access(struct dm_target *ti, pgoff_t pgoff,
 		long nr_pages, void **kaddr, pfn_t *pfn)
 {
@@ -339,8 +363,17 @@ static size_t stripe_dax_copy_from_iter(struct dm_target *ti, pgoff_t pgoff,
 
 	if (bdev_dax_pgoff(bdev, dev_sector, ALIGN(bytes, PAGE_SIZE), &pgoff))
 		return 0;
-	// return dax_copy_from_iter(dax_dev, pgoff, addr, bytes, i);
-	return dma_copy_from_iter(bdev, addr, bytes, i);
+
+	switch(sysctl_fastmove.mode){
+	case SYSCTL_FASTMOVE_DM:
+		return dax_copy_from_iter_fastmove(bdev, addr, bytes, i);
+		break;
+	case SYSCTL_FASTMOVE_CPU:
+	case SYSCTL_FASTMOVE_DMA:
+	default:
+		return dax_copy_from_iter(dax_dev, pgoff, addr, bytes, i);
+		break;
+	}
 }
 
 static size_t stripe_dax_copy_to_iter(struct dm_target *ti, pgoff_t pgoff,
@@ -359,8 +392,17 @@ static size_t stripe_dax_copy_to_iter(struct dm_target *ti, pgoff_t pgoff,
 
 	if (bdev_dax_pgoff(bdev, dev_sector, ALIGN(bytes, PAGE_SIZE), &pgoff))
 		return 0;
-	// return dax_copy_to_iter(dax_dev, pgoff, addr, bytes, i);
-	return dma_copy_to_iter(bdev, addr, bytes, i);
+
+	switch(sysctl_fastmove.mode){
+	case SYSCTL_FASTMOVE_DM:
+		return dax_copy_to_iter_fastmove(bdev, addr, bytes, i);
+		break;
+	case SYSCTL_FASTMOVE_CPU:
+	case SYSCTL_FASTMOVE_DMA:
+	default:
+		return dax_copy_to_iter(dax_dev, pgoff, addr, bytes, i);
+		break;
+	}
 }
 
 static int stripe_dax_zero_page_range(struct dm_target *ti, pgoff_t pgoff,
@@ -512,6 +554,7 @@ static struct target_type stripe_target = {
 	.dax_copy_from_iter = stripe_dax_copy_from_iter,
 	.dax_copy_to_iter = stripe_dax_copy_to_iter,
 	.dax_zero_page_range = stripe_dax_zero_page_range,
+	.dm_get_dax_size = stripe_get_total_size,
 };
 
 int __init dm_stripe_init(void)

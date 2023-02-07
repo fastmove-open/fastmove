@@ -322,6 +322,45 @@ long dax_direct_access(struct dax_device *dax_dev, pgoff_t pgoff, long nr_pages,
 }
 EXPORT_SYMBOL_GPL(dax_direct_access);
 
+long dax_get_size(struct dax_device *dax_dev, void ***virt_addr_list,
+		pfn_t **pfn_list, int *size, struct block_device ***bdev_list)
+{
+	long avail;
+
+	if (!dax_dev)
+		return -EOPNOTSUPP;
+
+	if (!dax_alive(dax_dev))
+		return -ENXIO;
+
+	if (!dax_dev->ops->dax_get_size) {
+		// dax_get_size not supported, fall back to dax_direct_access
+		if (!dax_dev->ops->direct_access)
+			return -EINVAL;
+
+		// Allocate for 1 virt_addr (void *)
+		*virt_addr_list = kmalloc(sizeof(void *), GFP_KERNEL);
+
+		// Allocate for 1 pfn (pfn_t)
+		*pfn_list = kmalloc(sizeof(pfn_t), GFP_KERNEL);
+
+		*size = 1;
+
+		// TODO: Actually, this will not be accessed
+		*bdev_list = kmalloc(sizeof(struct block_device *), GFP_KERNEL);
+
+		return dax_dev->ops->direct_access(dax_dev, 0, LONG_MAX / PAGE_SIZE, *virt_addr_list, *pfn_list);
+	}
+
+	avail = dax_dev->ops->dax_get_size(dax_dev, virt_addr_list, pfn_list, size, bdev_list);
+
+	if (!avail)
+		return -ERANGE;
+
+	return avail;
+}
+EXPORT_SYMBOL_GPL(dax_get_size);
+
 bool dax_supported(struct dax_device *dax_dev, struct block_device *bdev,
 		int blocksize, sector_t start, sector_t len)
 {

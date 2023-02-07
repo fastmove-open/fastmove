@@ -1217,6 +1217,13 @@ int dma_async_device_register(struct dma_device *device)
 		return -EIO;
 	}
 
+	if (dma_has_cap(DMA_MEMCPY_SG, device->cap_mask) && !device->device_prep_dma_memcpy_sg) {
+		dev_err(device->dev,
+			"Device claims capability %s, but op is not defined\n",
+			"DMA_MEMCPY_SG");
+		return -EIO;
+	}
+
 	if (dma_has_cap(DMA_CYCLIC, device->cap_mask) && !device->device_prep_dma_cyclic) {
 		dev_err(device->dev,
 			"Device claims capability %s, but op is not defined\n",
@@ -1418,11 +1425,38 @@ static struct dmaengine_unmap_pool *__get_unmap_pool(int nr)
 	}
 }
 
+static void dmaengine_unmap_sg(struct dmaengine_unmap_data *unmap)
+{
+	struct device *dev = unmap->dev;
+
+	if (unmap->to_sg) {
+		dma_unmap_sg(dev, unmap->unmap_sg.sg,
+				unmap->sg_nents, DMA_TO_DEVICE);
+
+		dma_unmap_page(dev, unmap->unmap_sg.buf_phys, unmap->len,
+					DMA_FROM_DEVICE);
+	}
+
+	if (unmap->from_sg) {
+		dma_unmap_page(dev, unmap->unmap_sg.buf_phys, unmap->len,
+				DMA_TO_DEVICE);
+		dma_unmap_sg(dev, unmap->unmap_sg.sg,
+				unmap->sg_nents, DMA_FROM_DEVICE);
+	}
+
+	mempool_free(unmap, __get_unmap_pool(unmap->map_cnt)->pool);
+}
+
 static void dmaengine_unmap(struct kref *kref)
 {
 	struct dmaengine_unmap_data *unmap = container_of(kref, typeof(*unmap), kref);
 	struct device *dev = unmap->dev;
 	int cnt, i;
+
+	if (unmap->to_sg || unmap->from_sg) {
+		dmaengine_unmap_sg(unmap);
+		return;
+	}
 
 	cnt = unmap->to_cnt;
 	for (i = 0; i < cnt; i++)

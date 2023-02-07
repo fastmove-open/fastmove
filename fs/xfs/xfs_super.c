@@ -1071,7 +1071,7 @@ xfs_fs_put_super(
 	/* if ->fill_super failed, we have no mount to tear down */
 	if (!sb->s_fs_info)
 		return;
-	
+
 	xfs_notice(mp, "Unmounting Filesystem");
 	xfs_filestream_unmount(mp);
 	xfs_unmountfs(mp);

@@ -62,10 +62,6 @@
 static struct ext4_lazy_init *ext4_li_info;
 static struct mutex ext4_li_mtx;
 static struct ratelimit_state ext4_mount_msg_ratelimit;
-int sdma_thd_per_node;
-
-module_param(sdma_thd_per_node, uint, 0444);
-MODULE_PARM_DESC(sdma_thd_per_node, "Number of dma threads");
 
 static int ext4_load_journal(struct super_block *, struct ext4_super_block *,
 			     unsigned long journal_devnum);

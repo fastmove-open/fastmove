@@ -1376,7 +1376,7 @@ mpol_out:
  */
 
 /* Copy a node mask from user space. */
-static int get_nodes(nodemask_t *nodes, const unsigned long __user *nmask,
+int get_nodes(nodemask_t *nodes, const unsigned long __user *nmask,
 		     unsigned long maxnode)
 {
 	unsigned long k;
@@ -2193,6 +2193,42 @@ alloc_pages_vma(gfp_t gfp, int order, struct vm_area_struct *vma,
 		goto out;
 	}
 
+	if (pol->mode == MPOL_PREFERRED && (pol->flags & MPOL_F_MEMCG)) {
+		struct task_struct *p = current;
+		struct mem_cgroup *memcg = mem_cgroup_from_task(p);
+		int nid = pol->v.preferred_node;
+		unsigned long nr_memcg_node_size;
+		struct mm_struct *mm = get_task_mm(p);
+		unsigned long nr_pages = hugepage?HPAGE_PMD_NR:1;
+
+		if (!(memcg && mm)) {
+			if (mm)
+				mmput(mm);
+			goto use_other_policy;
+		}
+
+		/* skip preferred node if mm_manage is going on */
+		if (test_bit(MMF_MM_MANAGE, &mm->flags)) {
+			nid = next_memory_node(nid);
+			if (nid == MAX_NUMNODES)
+				nid = first_memory_node;
+		}
+		mmput(mm);
+
+		nr_memcg_node_size = memcg_max_size_node(memcg, nid);
+
+		while (nr_memcg_node_size != ULONG_MAX &&
+			   nr_memcg_node_size <= (memcg_size_node(memcg, nid) + nr_pages)) {
+			if ((nid = next_memory_node(nid)) == MAX_NUMNODES)
+				nid = first_memory_node;
+			nr_memcg_node_size = memcg_max_size_node(memcg, nid);
+		}
+
+		mpol_cond_put(pol);
+		page = __alloc_pages_node(nid, gfp | __GFP_THISNODE, order);
+		goto out;
+	}
+use_other_policy:
 	if (unlikely(IS_ENABLED(CONFIG_TRANSPARENT_HUGEPAGE) && hugepage)) {
 		int hpage_node = node;
 

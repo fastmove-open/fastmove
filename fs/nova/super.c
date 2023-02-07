@@ -38,7 +38,6 @@
 #include <linux/cred.h>
 #include <linux/list.h>
 #include <linux/dax.h>
-#include <linux/uio.h>
 #include "nova.h"
 #include "journal.h"
 #include "super.h"
@@ -51,7 +50,6 @@ int data_csum;
 int data_parity;
 int dram_struct_csum;
 int support_clwb;
-int sdma_thd_per_node;
 
 module_param(measure_timing, int, 0444);
 MODULE_PARM_DESC(measure_timing, "Timing measurement");
@@ -73,9 +71,6 @@ MODULE_PARM_DESC(dram_struct_csum, "Protect key DRAM data structures with checks
 
 module_param(nova_dbgmask, int, 0444);
 MODULE_PARM_DESC(nova_dbgmask, "Control debugging output");
-
-module_param(sdma_thd_per_node, uint, 0444);
-MODULE_PARM_DESC(sdma_thd_per_node, "Number of dma threads");
 
 static struct super_operations nova_sops;
 static const struct export_operations nova_export_ops;

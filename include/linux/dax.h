@@ -36,6 +36,14 @@ struct dax_operations {
 			struct iov_iter *);
 	/* zero_page_range: required operation. Zero page range   */
 	int (*zero_page_range)(struct dax_device *, pgoff_t, size_t);
+	/*
+	 * dax_get_size: Get the total size of this dax_device
+	 * This function will try to get the total avaible size of the dax device,
+	 * and return the virt address list, pfn list and the number of devices
+	 * in this target.
+	 * This will also return the bdev list.
+	 */
+	long (*dax_get_size)(struct dax_device *, void ***, pfn_t **, int *, struct block_device ***bdev_list);
 };
 
 extern struct attribute_group dax_attribute_group;
@@ -214,6 +222,8 @@ bool dax_alive(struct dax_device *dax_dev);
 void *dax_get_private(struct dax_device *dax_dev);
 long dax_direct_access(struct dax_device *dax_dev, pgoff_t pgoff, long nr_pages,
 		void **kaddr, pfn_t *pfn);
+long dax_get_size(struct dax_device *dax_dev, void ***virt_addr_list,
+        pfn_t **pfn_list, int *size, struct block_device ***bdev_list);
 size_t dax_copy_from_iter(struct dax_device *dax_dev, pgoff_t pgoff, void *addr,
 		size_t bytes, struct iov_iter *i);
 size_t dax_copy_to_iter(struct dax_device *dax_dev, pgoff_t pgoff, void *addr,

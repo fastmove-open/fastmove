@@ -71,6 +71,7 @@
 #include <linux/coredump.h>
 #include <linux/latencytop.h>
 #include <linux/pid.h>
+#include <linux/copy_accel.h>
 
 #include "../lib/kstrtox.h"
 
@@ -105,6 +106,13 @@
 #endif
 
 #if defined(CONFIG_SYSCTL)
+
+extern int accel_page_copy;
+extern unsigned int limit_mt_num;
+extern int use_all_dma_chans;
+extern int limit_dma_chans;
+extern int sysctl_enable_thp_migration;
+extern int migration_batch_size;
 
 /* Constants used for minimum and  maximum */
 #ifdef CONFIG_LOCKUP_DETECTOR
@@ -201,6 +209,8 @@ static int max_sched_tunable_scaling = SCHED_TUNABLESCALING_END-1;
 #ifdef CONFIG_COMPACTION
 static int min_extfrag_threshold;
 static int max_extfrag_threshold = 1000;
+extern int use_concur_to_compact;
+extern int num_block_to_scan;
 #endif
 
 #endif /* CONFIG_SYSCTL */
@@ -2814,13 +2824,81 @@ static struct ctl_table vm_table[] = {
 		.extra2			= SYSCTL_ONE,
 	},
 #endif
-	 {
+	{
+		.procname	= "accel_page_copy",
+		.data		= &accel_page_copy,
+		.maxlen		= sizeof(accel_page_copy),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec,
+		.extra1		= SYSCTL_ZERO,
+		.extra2		= SYSCTL_ONE,
+	},
+	{
+		.procname	= "limit_mt_num",
+		.data		= &limit_mt_num,
+		.maxlen		= sizeof(limit_mt_num),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec,
+		.extra1		= SYSCTL_ZERO,
+	},
+	{
+		.procname	= "use_all_dma_chans",
+		.data		= &use_all_dma_chans,
+		.maxlen		= sizeof(use_all_dma_chans),
+		.mode		= 0644,
+		.proc_handler	= sysctl_dma_page_migration,
+		.extra1		= SYSCTL_ZERO,
+		.extra2		= SYSCTL_ONE,
+	},
+	{
+		.procname	= "limit_dma_chans",
+		.data		= &limit_dma_chans,
+		.maxlen		= sizeof(limit_dma_chans),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec,
+		.extra1		= SYSCTL_ZERO,
+	},
+	{
+		.procname	= "use_concur_to_compact",
+		.data		= &use_concur_to_compact,
+		.maxlen		= sizeof(use_concur_to_compact),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec,
+		.extra1		= SYSCTL_ZERO,
+		.extra2		= SYSCTL_ONE,
+	},
+	{
+		.procname	= "num_block_to_scan",
+		.data		= &num_block_to_scan,
+		.maxlen		= sizeof(num_block_to_scan),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec,
+		.extra1		= SYSCTL_ZERO,
+		.extra2		= SYSCTL_ONE,
+	},
+	{
+		.procname	= "sysctl_enable_thp_migration",
+		.data		= &sysctl_enable_thp_migration,
+		.maxlen		= sizeof(sysctl_enable_thp_migration),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec,
+		.extra1		= SYSCTL_ZERO,
+		.extra2		= SYSCTL_ONE,
+	},
+	{
+		.procname	= "migration_batch_size",
+		.data		= &migration_batch_size,
+		.maxlen		= sizeof(migration_batch_size),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec,
+	},
+	{
 		.procname	= "hugetlb_shm_group",
 		.data		= &sysctl_hugetlb_shm_group,
 		.maxlen		= sizeof(gid_t),
 		.mode		= 0644,
 		.proc_handler	= proc_dointvec,
-	 },
+	},
 	{
 		.procname	= "nr_overcommit_hugepages",
 		.data		= NULL,
@@ -3244,71 +3322,6 @@ static struct ctl_table fs_table[] = {
 		.proc_handler	= proc_doulongvec_minmax,
 	},
 #endif /* CONFIG_AIO */
-#ifdef CONFIG_COPY_ACCEL
-	{
-		.procname	= "copy-accel-dbg-mask",
-		.data		= &copy_accel_dbg_mask,
-		.maxlen		= sizeof(copy_accel_dbg_mask),
-		.mode		= 0644,
-		.proc_handler	= proc_doulongvec_minmax,
-	},
-	{
-		.procname	= "copy-accel-max-dma-concurrency",
-		.data		= &copy_accel_max_dma_concurrency,
-		.maxlen		= sizeof(copy_accel_max_dma_concurrency),
-		.mode		= 0644,
-		.proc_handler	= proc_doulongvec_minmax,
-	},
-	{
-		.procname	= "copy-accel-ddio-enabled",
-		.data		= &copy_accel_ddio_enabled,
-		.maxlen		= sizeof(copy_accel_ddio_enabled),
-		.mode		= 0644,
-		.proc_handler	= proc_dointvec_minmax,
-	},
-	{
-		.procname	= "copy-accel-sync-wait",
-		.data		= &copy_accel_sync_wait,
-		.maxlen		= sizeof(copy_accel_sync_wait),
-		.mode		= 0644,
-		.proc_handler	= proc_dointvec_minmax,
-	},
-	{
-		.procname	= "copy-accel-local-read-threshold",
-		.data		= &copy_accel_local_read_threshold,
-		.maxlen		= sizeof(copy_accel_local_read_threshold),
-		.mode		= 0644,
-		.proc_handler	= proc_doulongvec_minmax,
-	},
-	{
-		.procname	= "copy-accel-remote-read-threshold",
-		.data		= &copy_accel_remote_read_threshold,
-		.maxlen		= sizeof(copy_accel_remote_read_threshold),
-		.mode		= 0644,
-		.proc_handler	= proc_doulongvec_minmax,
-	},
-	{
-		.procname	= "copy-accel-local-write-threshold",
-		.data		= &copy_accel_local_write_threshold,
-		.maxlen		= sizeof(copy_accel_local_write_threshold),
-		.mode		= 0644,
-		.proc_handler	= proc_doulongvec_minmax,
-	},
-	{
-		.procname	= "copy-accel-remote-write-threshold",
-		.data		= &copy_accel_remote_write_threshold,
-		.maxlen		= sizeof(copy_accel_remote_write_threshold),
-		.mode		= 0644,
-		.proc_handler	= proc_doulongvec_minmax,
-	},
-	{
-		.procname	= "copy-accel-enabled-nodes",
-		.data		= &copy_accel_enabled_nodes,
-		.maxlen		= sizeof(copy_accel_enabled_nodes),
-		.mode		= 0644,
-		.proc_handler	= proc_dointvec_minmax,
-	},
-#endif
 #ifdef CONFIG_INOTIFY_USER
 	{
 		.procname	= "inotify",
@@ -3408,6 +3421,125 @@ static struct ctl_table fs_table[] = {
 	{ }
 };
 
+#ifdef CONFIG_COPY_ACCEL
+static struct ctl_table accel_table[] = {
+	{
+		.procname	= "mode",
+		.data		= &sysctl_fastmove.mode,
+		.maxlen		= sizeof(sysctl_fastmove.mode),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec,
+	},
+	{
+		.procname	= "fastmove",
+		.data		= &sysctl_fastmove.enable,
+		.maxlen		= sizeof(sysctl_fastmove.enable),
+		.mode		= 0644,
+		.proc_handler	= sysctl_fastmove_control,
+		.extra1		= SYSCTL_ZERO,
+		.extra2		= SYSCTL_ONE,
+	},
+	{
+		.procname	= "memcg",
+		.data		= &sysctl_fastmove.memcg,
+		.maxlen		= sizeof(sysctl_fastmove.memcg),
+		.mode		= 0644,
+		.proc_handler	= sysctl_memcg_control,
+	},
+	{
+		.procname	= "show-stats",
+		.data		= &sysctl_fastmove.show_stats,
+		.maxlen		= sizeof(sysctl_fastmove.show_stats),
+		.mode		= 0644,
+		.proc_handler	= sysctl_fastmove_stats,
+	},
+	{
+		.procname	= "ddio",
+		.data		= &sysctl_fastmove.ddio,
+		.maxlen		= sizeof(sysctl_fastmove.ddio),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= SYSCTL_ZERO,
+		.extra2		= SYSCTL_ONE,
+	},
+	{
+		.procname	= "sync-wait",
+		.data		= &sysctl_fastmove.sync_wait,
+		.maxlen		= sizeof(sysctl_fastmove.sync_wait),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= SYSCTL_ZERO,
+		.extra2		= SYSCTL_ONE,
+	},
+	{
+		.procname	= "scatter",
+		.data		= &sysctl_fastmove.scatter,
+		.maxlen		= sizeof(sysctl_fastmove.scatter),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= SYSCTL_ZERO,
+		.extra2		= SYSCTL_ONE,
+	},
+	{
+		.procname	= "num-nodes",
+		.data		= &sysctl_fastmove.num_nodes,
+		.maxlen		= sizeof(sysctl_fastmove.num_nodes),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec,
+	},
+	{
+		.procname	= "dbg-mask",
+		.data		= &sysctl_fastmove.dbg_mask,
+		.maxlen		= sizeof(sysctl_fastmove.dbg_mask),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
+	},
+	{
+		.procname	= "user-nums",
+		.data		= &sysctl_fastmove.max_user_num,
+		.maxlen		= sizeof(sysctl_fastmove.max_user_num),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
+	},
+	{
+		.procname	= "chunks",
+		.data		= &sysctl_fastmove.chunks,
+		.maxlen		= sizeof(sysctl_fastmove.chunks),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
+	},
+	{
+		.procname	= "local-read",
+		.data		= &sysctl_fastmove.local_read,
+		.maxlen		= sizeof(sysctl_fastmove.local_read),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
+	},
+	{
+		.procname	= "remote-read",
+		.data		= &sysctl_fastmove.remote_read,
+		.maxlen		= sizeof(sysctl_fastmove.remote_read),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
+	},
+	{
+		.procname	= "local-write",
+		.data		= &sysctl_fastmove.local_write,
+		.maxlen		= sizeof(sysctl_fastmove.local_write),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
+	},
+	{
+		.procname	= "remote-write",
+		.data		= &sysctl_fastmove.remote_write,
+		.maxlen		= sizeof(sysctl_fastmove.remote_write),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
+	},
+	{ }
+};
+#endif
+
 static struct ctl_table debug_table[] = {
 #ifdef CONFIG_SYSCTL_EXCEPTION_TRACE
 	{
@@ -3452,6 +3584,13 @@ static struct ctl_table sysctl_base_table[] = {
 		.mode		= 0555,
 		.child		= fs_table,
 	},
+#ifdef CONFIG_COPY_ACCEL
+	{
+		.procname	= "accel",
+		.mode		= 0555,
+		.child		= accel_table,
+	},
+#endif
 	{
 		.procname	= "debug",
 		.mode		= 0555,

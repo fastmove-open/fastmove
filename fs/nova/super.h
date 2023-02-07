@@ -1,6 +1,5 @@
 #ifndef __SUPER_H
 #define __SUPER_H
-#include <linux/copy_accel.h>
 /*
  * Structure of the NOVA super block in PMEM
  *

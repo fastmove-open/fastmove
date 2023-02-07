@@ -1104,6 +1104,28 @@ static struct dm_target *dm_dax_get_live_target(struct mapped_device *md,
 	return ti;
 }
 
+static long dm_dax_total_size(struct dax_device *dax_dev, void ***virt_addr_list, pfn_t **pfn_list, int *size, struct block_device ***bdev_list)
+{
+    struct mapped_device *md = dax_get_private(dax_dev);
+    struct dm_target *ti;
+    long ret = -EIO;
+    int srcu_idx;
+
+    ti = dm_dax_get_live_target(md, 0, &srcu_idx);
+
+    if (!ti)
+        goto out;
+    if (!ti->type->dm_get_dax_size)
+        goto out;
+
+    ret = ti->type->dm_get_dax_size(ti, virt_addr_list, pfn_list, size, bdev_list);
+
+out:
+    dm_put_live_table(md, srcu_idx);
+
+    return ret;
+}
+
 static long dm_dax_direct_access(struct dax_device *dax_dev, pgoff_t pgoff,
 				 long nr_pages, void **kaddr, pfn_t *pfn)
 {
@@ -3249,6 +3271,7 @@ static const struct dax_operations dm_dax_ops = {
 	.copy_from_iter = dm_dax_copy_from_iter,
 	.copy_to_iter = dm_dax_copy_to_iter,
 	.zero_page_range = dm_dax_zero_page_range,
+	.dax_get_size = dm_dax_total_size,
 };
 
 /*
