@@ -2,7 +2,7 @@
 ## Description
 
 This repository contains a modified Linux-5.9 kernel, Fastmove implementation,
-NOVA codes. Bench scripts can be found in [fastmove-bench](https://github.com/fastmove-open/fastmove-bench). Following the commands below to evaluate Fastmove.
+NOVA codes. Bench scripts can be found in [fastmove_bench](https://github.com/fastmove-open/fastmove_bench). Following the commands below to evaluate Fastmove.
 
 ## How to test Fastmove
 
